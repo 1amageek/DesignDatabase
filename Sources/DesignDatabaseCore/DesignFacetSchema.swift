@@ -1,6 +1,6 @@
 import CircuiteFoundation
 
-public struct DesignFacetSchema: Sendable, Hashable, Codable {
+public struct DesignFacetSchema: Sendable, Hashable, DesignDatabaseSerializable {
   public let descriptor: DesignSchemaDescriptor
   public let entities: [DesignEntitySchema]
   public let indexes: Set<DesignIndexKind>
@@ -26,6 +26,7 @@ public struct DesignFacetSchema: Sendable, Hashable, Codable {
     self.indexes = indexes.union([.entity, .facet, .change])
   }
 
+#if DESIGN_DATABASE_FOUNDATION_SERIALIZATION
   public init(from decoder: any Decoder) throws {
     let container = try decoder.container(keyedBy: CodingKeys.self)
     try self.init(
@@ -34,10 +35,13 @@ public struct DesignFacetSchema: Sendable, Hashable, Codable {
       indexes: container.decode(Set<DesignIndexKind>.self, forKey: .indexes)
     )
   }
+#endif
 
+#if DESIGN_DATABASE_FOUNDATION_SERIALIZATION
   private enum CodingKeys: String, CodingKey {
     case descriptor
     case entities
     case indexes
   }
+#endif
 }

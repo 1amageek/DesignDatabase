@@ -1,4 +1,4 @@
-public enum DesignValueKind: String, Sendable, Hashable, Codable {
+public enum DesignValueKind: String, Sendable, Hashable, DesignDatabaseSerializable {
   case signed
   case unsigned
   case real

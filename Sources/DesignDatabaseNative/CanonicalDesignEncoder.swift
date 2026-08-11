@@ -1,4 +1,5 @@
 import CircuiteFoundation
+import CircuiteFoundationFoundation
 import DesignDatabaseCore
 import Foundation
 

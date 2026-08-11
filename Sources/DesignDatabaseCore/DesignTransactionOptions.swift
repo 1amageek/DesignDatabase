@@ -1,6 +1,6 @@
 import CircuiteFoundation
 
-public struct DesignTransactionOptions: Sendable, Hashable, Codable {
+public struct DesignTransactionOptions: Sendable, Hashable, DesignDatabaseSerializable {
   public let provenance: ExecutionProvenance?
   public let maximumChangedEntities: UInt64
 

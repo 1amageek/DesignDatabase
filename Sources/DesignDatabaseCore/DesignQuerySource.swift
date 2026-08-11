@@ -1,6 +1,6 @@
 import CircuiteFoundation
 
-public enum DesignQuerySource: Sendable, Hashable, Codable {
+public enum DesignQuerySource: Sendable, Hashable, DesignDatabaseSerializable {
   case entities(Set<DesignEntityID>)
   case facet(DesignFacetID, kind: DesignEntityKindID?)
   case name(

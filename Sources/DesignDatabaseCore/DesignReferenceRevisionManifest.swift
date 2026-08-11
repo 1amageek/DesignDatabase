@@ -1,14 +1,13 @@
 import CircuiteFoundation
-import Foundation
 
-public struct DesignRevisionManifest: Sendable, Hashable, Codable {
+public struct DesignReferenceRevisionManifest: Sendable, Hashable, DesignDatabaseSerializable {
   public let revision: DesignRevisionReference
   public let parents: [DesignRevisionReference]
   public let stateDigest: ContentDigest
   public let schemaDigests: [DesignSchemaID: ContentDigest]
   public let changeSetDigest: ContentDigest
   public let provenance: ExecutionProvenance?
-  public let createdAt: Date
+  public let createdAt: ExecutionTimestamp
 
   public init(
     revision: DesignRevisionReference,
@@ -17,7 +16,7 @@ public struct DesignRevisionManifest: Sendable, Hashable, Codable {
     schemaDigests: [DesignSchemaID: ContentDigest],
     changeSetDigest: ContentDigest,
     provenance: ExecutionProvenance?,
-    createdAt: Date
+    createdAt: ExecutionTimestamp
   ) {
     self.revision = revision
     self.parents = parents

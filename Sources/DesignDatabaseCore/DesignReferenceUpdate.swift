@@ -1,6 +1,6 @@
 import CircuiteFoundation
 
-public struct DesignReferenceUpdate: Sendable, Hashable, Codable {
+public struct DesignReferenceUpdate: Sendable, Hashable, DesignDatabaseSerializable {
   public let name: DesignReferenceName
   public let previous: DesignRevisionReference?
   public let current: DesignRevisionReference

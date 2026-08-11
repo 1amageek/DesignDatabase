@@ -1,25 +1,41 @@
 import CircuiteFoundation
+import CircuiteFoundationCrypto
+import CircuiteFoundationFoundation
 import DesignDatabaseCore
 import Foundation
 
-public actor NativeDesignDatabase: DesignDatabase {
+public actor NativeDesignDatabase: DesignDatabaseReference {
   public nonisolated let databaseID: DesignDatabaseID
   public nonisolated let capabilities: DesignCapabilitySet
+  public nonisolated let authorizationSubjectScopeID: DesignAuthorizationSubjectScopeID
+  public nonisolated let authorizationGrants: DesignDatabaseAuthorizationGrantSet
 
   private let schemas: [DesignFacetID: DesignFacetSchema]
   private let validators: [DesignFacetID: any DesignFacetValidating]
+  private let authorizer: any DesignDatabaseAuthorizing
   private let persistence: (any DesignDatabasePersisting)?
   private let digester: any ContentDigesting
   private let identifierGenerator: RandomDesignIdentifierGenerator
   private var revisions: [DesignRevisionID: DesignStoredRevision]
   private var references: [DesignReferenceName: DesignRevisionReference]
+  private var retentionClaims: [
+    DesignRevisionRetentionID: DesignRevisionRetentionClaim
+  ]
+  private var operationRecords: [
+    DesignDatabaseOperationReference: DesignDatabaseOperationRecord
+  ]
+  private var persistenceGeneration: UInt64
+  private var reachabilityGeneration: UInt64
   private var nextEntityValue: UInt64
-  private var snapshotCache: [DesignRevisionID: DesignReadSnapshot]
+  private var snapshotCache: [DesignRevisionID: DesignReferenceReadSnapshot]
   private var isClosed: Bool
-  private var isPublishing: Bool
+  private var publicationState: NativeDesignDatabasePublicationState
 
   public init(
-    request: DesignDatabaseCreateRequest,
+    request: DesignReferenceDatabaseCreateRequest,
+    authorizationSubjectScopeID: DesignAuthorizationSubjectScopeID,
+    authorizationGrants: DesignDatabaseAuthorizationGrantSet,
+    authorizer: any DesignDatabaseAuthorizing,
     persistence: (any DesignDatabasePersisting)? = nil,
     digester: any ContentDigesting = SHA256ContentDigester(),
     identifierGenerator: RandomDesignIdentifierGenerator = .init()
@@ -42,7 +58,7 @@ public actor NativeDesignDatabase: DesignDatabase {
       changes: [],
       digest: changeDigest
     )
-    let manifest = DesignRevisionManifest(
+    let manifest = DesignReferenceRevisionManifest(
       revision: revision,
       parents: [],
       stateDigest: stateDigest,
@@ -53,12 +69,15 @@ public actor NativeDesignDatabase: DesignDatabase {
       ),
       changeSetDigest: changeDigest,
       provenance: nil,
-      createdAt: Date()
+      createdAt: try Self.currentTimestamp()
     )
     self.databaseID = databaseID
     self.capabilities = request.capabilities
+    self.authorizationSubjectScopeID = authorizationSubjectScopeID
+    self.authorizationGrants = authorizationGrants
     self.schemas = schemas
     self.validators = validators
+    self.authorizer = authorizer
     self.persistence = persistence
     self.digester = digester
     self.identifierGenerator = identifierGenerator
@@ -66,15 +85,22 @@ public actor NativeDesignDatabase: DesignDatabase {
       revisionID: DesignStoredRevision(manifest: manifest, entities: [:], changeSet: changeSet)
     ]
     self.references = [.main: revision]
+    self.retentionClaims = [:]
+    self.operationRecords = [:]
+    self.persistenceGeneration = 1
+    self.reachabilityGeneration = 1
     self.nextEntityValue = 0
     self.snapshotCache = [:]
     self.isClosed = false
-    self.isPublishing = false
+    self.publicationState = .idle
   }
 
   public init(
     image: DesignDatabaseImage,
     validators: [any DesignFacetValidating],
+    authorizationSubjectScopeID: DesignAuthorizationSubjectScopeID,
+    authorizationGrants: DesignDatabaseAuthorizationGrantSet,
+    authorizer: any DesignDatabaseAuthorizing,
     persistence: (any DesignDatabasePersisting)? = nil,
     digester: any ContentDigesting = SHA256ContentDigester(),
     identifierGenerator: RandomDesignIdentifierGenerator = .init()
@@ -82,29 +108,41 @@ public actor NativeDesignDatabase: DesignDatabase {
     let schemas = try Self.schemaMap(image.schemas)
     self.databaseID = image.databaseID
     self.capabilities = image.capabilities
+    self.authorizationSubjectScopeID = authorizationSubjectScopeID
+    self.authorizationGrants = authorizationGrants
     self.schemas = schemas
     self.validators = try Self.validatorMap(validators, schemas: schemas)
+    self.authorizer = authorizer
     self.persistence = persistence
     self.digester = digester
     self.identifierGenerator = identifierGenerator
     self.revisions = image.revisions
     self.references = image.references
+    self.retentionClaims = image.retentionClaims
+    self.operationRecords = image.operationRecords
+    self.persistenceGeneration = image.persistenceGeneration
+    self.reachabilityGeneration = image.reachabilityGeneration
     self.nextEntityValue = image.nextEntityValue
     self.snapshotCache = [:]
     self.isClosed = false
-    self.isPublishing = false
+    self.publicationState = .idle
     try Self.validateImage(image, schemas: schemas, digester: digester)
   }
 
   public func persistInitialState() async throws(DesignDatabaseError) {
     try requireOpen()
-    guard let persistence else { return }
-    try await persistence.persist(image(), publishing: references[.main])
+    guard persistence != nil else { return }
+    try await persist(
+      image(),
+      publishing: references[.main],
+      missingImageMeansUncommitted: true
+    )
   }
 
   public func resolve(
     _ selector: DesignRevisionSelector
   ) async throws(DesignDatabaseError) -> DesignRevisionReference {
+    try await requireAuthorization(.read)
     try requireOpen()
     switch selector {
     case .exact(let revision):
@@ -121,7 +159,8 @@ public actor NativeDesignDatabase: DesignDatabase {
 
   public func snapshot(
     at revision: DesignRevisionReference
-  ) async throws(DesignDatabaseError) -> DesignReadSnapshot {
+  ) async throws(DesignDatabaseError) -> DesignReferenceReadSnapshot {
+    try await requireAuthorization(.read)
     try requireOpen()
     try validateDatabase(revision)
     if let cached = snapshotCache[revision.revisionID] { return cached }
@@ -139,7 +178,7 @@ public actor NativeDesignDatabase: DesignDatabase {
         target: revision
       )
     }
-    let snapshot = DesignReadSnapshot(
+    let snapshot = DesignReferenceReadSnapshot(
       revision: revision,
       stateDigest: stored.manifest.stateDigest,
       facetSchemas: schemas,
@@ -152,7 +191,8 @@ public actor NativeDesignDatabase: DesignDatabase {
 
   public func manifest(
     at revision: DesignRevisionReference
-  ) async throws(DesignDatabaseError) -> DesignRevisionManifest {
+  ) async throws(DesignDatabaseError) -> DesignReferenceRevisionManifest {
+    try await requireAuthorization(.read)
     try requireOpen()
     try validateDatabase(revision)
     guard let stored = revisions[revision.revisionID] else {
@@ -166,8 +206,9 @@ public actor NativeDesignDatabase: DesignDatabase {
     options: DesignTransactionOptions,
     _ body: @Sendable (inout DesignTransaction) throws(DesignDatabaseError) -> Result
   ) async throws(DesignDatabaseError) -> DesignTransactionResult<Result> {
+    try await requireAuthorization(.proposeCandidate)
     try requireOpen()
-    try requireNotPublishing()
+    try requirePublicationIdle()
     try validateDatabase(base)
     guard let baseStored = revisions[base.revisionID] else { throw .revisionNotFound(base) }
     if Task.isCancelled { throw .cancelled }
@@ -217,7 +258,7 @@ public actor NativeDesignDatabase: DesignDatabase {
       base: base,
       target: candidate
     )
-    let manifest = DesignRevisionManifest(
+    let manifest = DesignReferenceRevisionManifest(
       revision: candidate,
       parents: [base],
       stateDigest: stateDigest,
@@ -228,7 +269,7 @@ public actor NativeDesignDatabase: DesignDatabase {
       ),
       changeSetDigest: changeSet.digest,
       provenance: provenance,
-      createdAt: Date()
+      createdAt: try Self.currentTimestamp()
     )
     let stored = DesignStoredRevision(
       manifest: manifest,
@@ -237,13 +278,19 @@ public actor NativeDesignDatabase: DesignDatabase {
     )
     var proposedRevisions = revisions
     proposedRevisions[candidateID] = stored
+    let proposedPersistenceGeneration = try incrementedPersistenceGeneration()
+    let proposedReachabilityGeneration = try incrementedReachabilityGeneration()
     let proposedImage = image(
       revisions: proposedRevisions,
       references: references,
+      persistenceGeneration: proposedPersistenceGeneration,
+      reachabilityGeneration: proposedReachabilityGeneration,
       nextEntityValue: state.nextEntityValue
     )
     try await persist(proposedImage, publishing: candidate)
     revisions = proposedRevisions
+    persistenceGeneration = proposedPersistenceGeneration
+    reachabilityGeneration = proposedReachabilityGeneration
     nextEntityValue = state.nextEntityValue
 
     return DesignTransactionResult(
@@ -261,8 +308,9 @@ public actor NativeDesignDatabase: DesignDatabase {
     expected: DesignRevisionReference?,
     desired: DesignRevisionReference
   ) async throws(DesignDatabaseError) -> DesignReferenceUpdate {
+    try await requireAuthorization(.promoteReference)
     try requireOpen()
-    try requireNotPublishing()
+    try requirePublicationIdle()
     try validateDatabase(desired)
     guard revisions[desired.revisionID] != nil else { throw .revisionNotFound(desired) }
     if let expected { try validateDatabase(expected) }
@@ -270,50 +318,381 @@ public actor NativeDesignDatabase: DesignDatabase {
     guard previous == expected else {
       throw .transactionConflict(expected: expected, actual: previous)
     }
+    if previous == desired {
+      return DesignReferenceUpdate(name: name, previous: previous, current: desired)
+    }
     var proposedReferences = references
     proposedReferences[name] = desired
-    let proposedImage = image(revisions: revisions, references: proposedReferences)
+    let proposedPersistenceGeneration = try incrementedPersistenceGeneration()
+    let proposedReachabilityGeneration = try incrementedReachabilityGeneration()
+    let proposedImage = image(
+      revisions: revisions,
+      references: proposedReferences,
+      persistenceGeneration: proposedPersistenceGeneration,
+      reachabilityGeneration: proposedReachabilityGeneration
+    )
     try await persist(proposedImage, publishing: nil)
     references = proposedReferences
+    persistenceGeneration = proposedPersistenceGeneration
+    reachabilityGeneration = proposedReachabilityGeneration
     return DesignReferenceUpdate(name: name, previous: previous, current: desired)
+  }
+
+  public func retain(
+    _ request: DesignRevisionRetentionRequest
+  ) async throws(DesignDatabaseError) -> DesignRevisionRetentionSubmission {
+    try await requireAuthorization(.retain)
+    try requireOpen()
+    try validateDatabase(request.revision)
+    let expectedRequestDigest = try DesignRevisionRetentionDigest.retainingRequest(
+      operationID: request.operationID,
+      claimID: request.claimID,
+      revision: request.revision,
+      reason: request.reason,
+      evidenceDigest: request.evidenceDigest,
+      using: digester
+    )
+    guard request.requestDigest == expectedRequestDigest else {
+      throw .contentDigest("Retention request digest does not match its canonical payload.")
+    }
+
+    let operation = operationReference(for: request.operationID)
+    if let existing = operationRecords[operation] {
+      return try retentionSubmission(
+        for: existing,
+        requestedDigest: request.requestDigest
+      )
+    }
+    if let reconciled = try await reconcilePendingRetentionIfNeeded(
+      operation: operation,
+      requestDigest: request.requestDigest
+    ) {
+      return reconciled
+    }
+    try requirePublicationIdle()
+
+    guard revisions[request.revision.revisionID] != nil else {
+      return try await persistRetentionRejection(
+        operation: operation,
+        requestDigest: request.requestDigest,
+        reason: .revisionNotFound
+      )
+    }
+
+    if let existingClaim = retentionClaims[request.claimID] {
+      let reason: DesignRevisionRetentionRejection.Reason
+      if existingClaim.ownerSubjectScopeID != authorizationSubjectScopeID {
+        reason = .claimUnavailable
+      } else {
+        switch existingClaim.state {
+        case .active:
+          reason = .claimAlreadyActive
+        case .released:
+          reason = .claimPermanentlyReleased
+        }
+      }
+      return try await persistRetentionRejection(
+        operation: operation,
+        requestDigest: request.requestDigest,
+        reason: reason
+      )
+    }
+
+    let proposedReachabilityGeneration = try incrementedReachabilityGeneration()
+    let claim = DesignRevisionRetentionClaim(
+      claimID: request.claimID,
+      revision: request.revision,
+      ownerSubjectScopeID: authorizationSubjectScopeID,
+      reason: request.reason,
+      evidenceDigest: request.evidenceDigest,
+      generation: 1,
+      state: .active
+    )
+    let receipt = try retentionReceipt(
+      operation: operation,
+      requestDigest: request.requestDigest,
+      claim: claim,
+      reachabilityGeneration: proposedReachabilityGeneration
+    )
+    let record = DesignDatabaseOperationRecord(
+      operation: operation,
+      requestDigest: request.requestDigest,
+      outcome: .retentionApplied(receipt)
+    )
+    var proposedClaims = retentionClaims
+    proposedClaims[request.claimID] = claim
+    var proposedRecords = operationRecords
+    proposedRecords[operation] = record
+    return try await persistRetentionOperation(
+      record,
+      proposedClaims: proposedClaims,
+      proposedRecords: proposedRecords,
+      proposedReachabilityGeneration: proposedReachabilityGeneration
+    )
+  }
+
+  public func releaseRetention(
+    _ request: DesignRevisionRetentionReleaseRequest
+  ) async throws(DesignDatabaseError) -> DesignRevisionRetentionSubmission {
+    try await requireAuthorization(.retain)
+    try requireOpen()
+    try validateDatabase(request.expectedRevision)
+    let expectedRequestDigest = try DesignRevisionRetentionDigest.releasingRequest(
+      operationID: request.operationID,
+      claimID: request.claimID,
+      expectedRevision: request.expectedRevision,
+      expectedGeneration: request.expectedGeneration,
+      using: digester
+    )
+    guard request.requestDigest == expectedRequestDigest else {
+      throw .contentDigest(
+        "Retention release request digest does not match its canonical payload."
+      )
+    }
+
+    let operation = operationReference(for: request.operationID)
+    if let existing = operationRecords[operation] {
+      return try retentionSubmission(
+        for: existing,
+        requestedDigest: request.requestDigest
+      )
+    }
+    if let reconciled = try await reconcilePendingRetentionIfNeeded(
+      operation: operation,
+      requestDigest: request.requestDigest
+    ) {
+      return reconciled
+    }
+    try requirePublicationIdle()
+
+    guard let existingClaim = retentionClaims[request.claimID] else {
+      return try await persistRetentionRejection(
+        operation: operation,
+        requestDigest: request.requestDigest,
+        reason: .claimUnavailable
+      )
+    }
+    guard existingClaim.ownerSubjectScopeID == authorizationSubjectScopeID else {
+      return try await persistRetentionRejection(
+        operation: operation,
+        requestDigest: request.requestDigest,
+        reason: .claimUnavailable
+      )
+    }
+    guard existingClaim.state == .active else {
+      return try await persistRetentionRejection(
+        operation: operation,
+        requestDigest: request.requestDigest,
+        reason: .claimPermanentlyReleased
+      )
+    }
+    guard existingClaim.revision == request.expectedRevision else {
+      return try await persistRetentionRejection(
+        operation: operation,
+        requestDigest: request.requestDigest,
+        reason: .revisionMismatch
+      )
+    }
+    guard existingClaim.generation == request.expectedGeneration else {
+      return try await persistRetentionRejection(
+        operation: operation,
+        requestDigest: request.requestDigest,
+        reason: .generationMismatch(actual: existingClaim.generation)
+      )
+    }
+    guard existingClaim.generation < UInt64.max else {
+      throw .generationExhausted(kind: "Design revision retention claim")
+    }
+
+    let proposedReachabilityGeneration = try incrementedReachabilityGeneration()
+    let releasedClaim = DesignRevisionRetentionClaim(
+      claimID: existingClaim.claimID,
+      revision: existingClaim.revision,
+      ownerSubjectScopeID: existingClaim.ownerSubjectScopeID,
+      reason: existingClaim.reason,
+      evidenceDigest: existingClaim.evidenceDigest,
+      generation: existingClaim.generation + 1,
+      state: .released
+    )
+    let receipt = try retentionReceipt(
+      operation: operation,
+      requestDigest: request.requestDigest,
+      claim: releasedClaim,
+      reachabilityGeneration: proposedReachabilityGeneration
+    )
+    let record = DesignDatabaseOperationRecord(
+      operation: operation,
+      requestDigest: request.requestDigest,
+      outcome: .retentionApplied(receipt)
+    )
+    var proposedClaims = retentionClaims
+    proposedClaims[request.claimID] = releasedClaim
+    var proposedRecords = operationRecords
+    proposedRecords[operation] = record
+    return try await persistRetentionOperation(
+      record,
+      proposedClaims: proposedClaims,
+      proposedRecords: proposedRecords,
+      proposedReachabilityGeneration: proposedReachabilityGeneration
+    )
+  }
+
+  public func retentionStatus(
+    operation: DesignDatabaseOperationReference,
+    requestDigest: ContentDigest
+  ) async throws(DesignDatabaseError) -> DesignRevisionRetentionStatus {
+    try requireOpen()
+    guard operation.databaseID == databaseID else {
+      throw .crossDatabaseReference(
+        expected: databaseID,
+        actual: operation.databaseID
+      )
+    }
+    try await requireOutcomeInspectionAuthorization(for: operation)
+    try requireOpen()
+
+    if let record = operationRecords[operation] {
+      return try retentionStatus(
+        for: record,
+        requestedDigest: requestDigest
+      )
+    }
+    switch publicationState {
+    case .retentionInProgress(let pending):
+      guard pending.record.operation == operation else {
+        return .notRecorded
+      }
+      guard pending.record.requestDigest == requestDigest else {
+        return .rejected(
+          try retentionConflictRejection(
+            operation: operation,
+            requestDigest: requestDigest
+          )
+        )
+      }
+      return .inProgress
+    case .unresolvedRetention(let pending):
+      guard pending.record.operation == operation else {
+        return .notRecorded
+      }
+      guard pending.record.requestDigest == requestDigest else {
+        return .rejected(
+          try retentionConflictRejection(
+            operation: operation,
+            requestDigest: requestDigest
+          )
+        )
+      }
+      switch try await reconcilePendingRetention(pending) {
+      case .committed(let submission):
+        return submission.status
+      case .notCommitted:
+        return .notRecorded
+      case .outcomeUnknown(let unknown):
+        return .outcomeUnknown(unknown)
+      }
+    case .idle, .genericInProgress, .unresolvedGeneric:
+      return .notRecorded
+    }
   }
 
   public func close() async throws(DesignDatabaseError) {
     if isClosed { return }
-    try requireNotPublishing()
+    switch publicationState {
+    case .genericInProgress, .retentionInProgress(_):
+      throw .persistence("Another publication is in progress.")
+    case .idle:
+      if persistence != nil {
+        try await persist(image(), publishing: nil)
+      }
+    case .unresolvedGeneric, .unresolvedRetention:
+      break
+    }
     if let persistence {
-      try await persist(image(), publishing: nil)
-      isPublishing = true
+      publicationState = .genericInProgress
       do {
         try await persistence.close()
       } catch {
         isClosed = true
-        isPublishing = false
+        publicationState = .idle
         throw error
       }
     }
     isClosed = true
-    isPublishing = false
+    publicationState = .idle
   }
 
   private func persist(
-    _ image: DesignDatabaseImage,
-    publishing revision: DesignRevisionReference?
+    _ proposedImage: DesignDatabaseImage,
+    publishing revision: DesignRevisionReference?,
+    missingImageMeansUncommitted: Bool = false
   ) async throws(DesignDatabaseError) {
     guard let persistence else { return }
-    isPublishing = true
+    try requirePublicationIdle()
+    let currentImage = image()
+    publicationState = .genericInProgress
     do {
-      try await persistence.persist(image, publishing: revision)
-      isPublishing = false
-    } catch {
-      isPublishing = false
-      throw error
+      try await persistence.persist(proposedImage, publishing: revision)
+      publicationState = .idle
+      return
+    } catch let persistenceError {
+      let loadedImage: DesignDatabaseImage?
+      do {
+        loadedImage = try await persistence.load()
+      } catch let reconciliationError {
+        publicationState = .unresolvedGeneric
+        switch reconciliationError {
+        case .corruption, .closed:
+          throw reconciliationError
+        default:
+          throw .persistence(
+            "Publication outcome is unknown and requires close/reopen reconciliation: "
+              + reconciliationError.localizedDescription
+          )
+        }
+      }
+
+      guard let loadedImage else {
+        if missingImageMeansUncommitted {
+          publicationState = .idle
+          throw persistenceError
+        }
+        publicationState = .unresolvedGeneric
+        throw .corruption("The persistent database image disappeared during publication.")
+      }
+
+      let reconciliation: NativeDesignDatabaseImageReconciliation
+      do {
+        reconciliation = try reconcile(
+          loadedImage,
+          currentImage: currentImage,
+          proposedImage: proposedImage
+        )
+      } catch {
+        publicationState = .unresolvedGeneric
+        throw error
+      }
+      publicationState = .idle
+      switch reconciliation {
+      case .committed:
+        return
+      case .notCommitted:
+        throw persistenceError
+      }
     }
   }
 
   private func image(
     revisions: [DesignRevisionID: DesignStoredRevision]? = nil,
     references: [DesignReferenceName: DesignRevisionReference]? = nil,
+    retentionClaims: [
+      DesignRevisionRetentionID: DesignRevisionRetentionClaim
+    ]? = nil,
+    operationRecords: [
+      DesignDatabaseOperationReference: DesignDatabaseOperationRecord
+    ]? = nil,
+    persistenceGeneration: UInt64? = nil,
+    reachabilityGeneration: UInt64? = nil,
     nextEntityValue: UInt64? = nil
   ) -> DesignDatabaseImage {
     DesignDatabaseImage(
@@ -322,6 +701,10 @@ public actor NativeDesignDatabase: DesignDatabase {
       capabilities: capabilities,
       revisions: revisions ?? self.revisions,
       references: references ?? self.references,
+      retentionClaims: retentionClaims ?? self.retentionClaims,
+      operationRecords: operationRecords ?? self.operationRecords,
+      persistenceGeneration: persistenceGeneration ?? self.persistenceGeneration,
+      reachabilityGeneration: reachabilityGeneration ?? self.reachabilityGeneration,
       nextEntityValue: nextEntityValue ?? self.nextEntityValue
     )
   }
@@ -344,8 +727,364 @@ public actor NativeDesignDatabase: DesignDatabase {
     if isClosed { throw .closed }
   }
 
-  private func requireNotPublishing() throws(DesignDatabaseError) {
-    if isPublishing { throw .persistence("Another publication is in progress.") }
+  private func requirePublicationIdle() throws(DesignDatabaseError) {
+    switch publicationState {
+    case .idle:
+      return
+    case .genericInProgress, .retentionInProgress(_):
+      throw .persistence("Another publication is in progress.")
+    case .unresolvedGeneric:
+      throw .persistence(
+        "A publication outcome is unresolved; close and reopen before mutating."
+      )
+    case .unresolvedRetention(let pending):
+      throw .persistence(
+        "Retention operation \(pending.record.operation.operationID.rawValue) "
+          + "must be reconciled before mutating."
+      )
+    }
+  }
+
+  private func requireAuthorization(
+    _ grant: DesignDatabaseAuthorizationGrant
+  ) async throws(DesignDatabaseError) {
+    try await authorizer.authorize(
+      grant,
+      for: authorizationSubjectScopeID
+    )
+  }
+
+  private func requireOutcomeInspectionAuthorization(
+    for operation: DesignDatabaseOperationReference
+  ) async throws(DesignDatabaseError) {
+    guard operation.authorizationSubjectScopeID == authorizationSubjectScopeID else {
+      try await requireAuthorization(.administer)
+      return
+    }
+    do {
+      try await requireAuthorization(.inspectOwnOperationOutcome)
+    } catch let error {
+      guard case .unauthorized = error else {
+        throw error
+      }
+      try await requireAuthorization(.administer)
+    }
+  }
+
+  private func operationReference(
+    for operationID: DesignDatabaseOperationID
+  ) -> DesignDatabaseOperationReference {
+    DesignDatabaseOperationReference(
+      databaseID: databaseID,
+      authorizationSubjectScopeID: authorizationSubjectScopeID,
+      operationID: operationID
+    )
+  }
+
+  private func incrementedPersistenceGeneration() throws(
+    DesignDatabaseError
+  ) -> UInt64 {
+    guard persistenceGeneration < UInt64.max else {
+      throw .generationExhausted(kind: "Database persistence")
+    }
+    return persistenceGeneration + 1
+  }
+
+  private func incrementedReachabilityGeneration() throws(
+    DesignDatabaseError
+  ) -> UInt64 {
+    guard reachabilityGeneration < UInt64.max else {
+      throw .generationExhausted(kind: "Database reachability")
+    }
+    return reachabilityGeneration + 1
+  }
+
+  private func reconcile(
+    _ loadedImage: DesignDatabaseImage,
+    currentImage: DesignDatabaseImage,
+    proposedImage: DesignDatabaseImage
+  ) throws(DesignDatabaseError) -> NativeDesignDatabaseImageReconciliation {
+    guard loadedImage.databaseID == databaseID else {
+      throw .corruption(
+        "Persistence returned database \(loadedImage.databaseID), expected \(databaseID)."
+      )
+    }
+    try Self.validateImage(loadedImage, schemas: schemas, digester: digester)
+
+    if loadedImage.persistenceGeneration == proposedImage.persistenceGeneration {
+      guard loadedImage == proposedImage else {
+        throw .corruption(
+          "Persisted image diverged at proposed generation "
+            + "\(proposedImage.persistenceGeneration)."
+        )
+      }
+      return .committed
+    }
+    if loadedImage.persistenceGeneration == currentImage.persistenceGeneration {
+      guard loadedImage == currentImage else {
+        throw .corruption(
+          "Persisted image diverged at current generation "
+            + "\(currentImage.persistenceGeneration)."
+        )
+      }
+      return .notCommitted
+    }
+    throw .corruption(
+      "Persisted image generation \(loadedImage.persistenceGeneration) is neither "
+        + "current \(currentImage.persistenceGeneration) nor proposed "
+        + "\(proposedImage.persistenceGeneration)."
+    )
+  }
+
+  private func retentionReceipt(
+    operation: DesignDatabaseOperationReference,
+    requestDigest: ContentDigest,
+    claim: DesignRevisionRetentionClaim,
+    reachabilityGeneration: UInt64
+  ) throws(DesignDatabaseError) -> DesignRevisionRetentionReceipt {
+    let outcomeDigest = try DesignRevisionRetentionDigest.appliedOutcome(
+      operation: operation,
+      requestDigest: requestDigest,
+      claimID: claim.claimID,
+      revision: claim.revision,
+      generation: claim.generation,
+      reachabilityGeneration: reachabilityGeneration,
+      state: claim.state,
+      using: digester
+    )
+    return DesignRevisionRetentionReceipt(
+      operation: operation,
+      claimID: claim.claimID,
+      revision: claim.revision,
+      generation: claim.generation,
+      reachabilityGeneration: reachabilityGeneration,
+      state: claim.state,
+      outcomeDigest: outcomeDigest
+    )
+  }
+
+  private func retentionSubmission(
+    for record: DesignDatabaseOperationRecord,
+    requestedDigest: ContentDigest
+  ) throws(DesignDatabaseError) -> DesignRevisionRetentionSubmission {
+    guard record.requestDigest == requestedDigest else {
+      return .rejected(try retentionConflictRejection(
+        operation: record.operation,
+        requestDigest: requestedDigest
+      ))
+    }
+    return record.retentionSubmission
+  }
+
+  private func retentionConflictRejection(
+    operation: DesignDatabaseOperationReference,
+    requestDigest: ContentDigest
+  ) throws(DesignDatabaseError) -> DesignRevisionRetentionRejection {
+    let reason = DesignRevisionRetentionRejection.Reason.operationRequestConflict
+    return DesignRevisionRetentionRejection(
+      operation: operation,
+      requestDigest: requestDigest,
+      reason: reason,
+      outcomeDigest: try DesignRevisionRetentionDigest.rejectedOutcome(
+        operation: operation,
+        requestDigest: requestDigest,
+        reason: reason,
+        using: digester
+      )
+    )
+  }
+
+  private func retentionStatus(
+    for record: DesignDatabaseOperationRecord,
+    requestedDigest: ContentDigest
+  ) throws(DesignDatabaseError) -> DesignRevisionRetentionStatus {
+    guard record.requestDigest == requestedDigest else {
+      return .rejected(try retentionConflictRejection(
+        operation: record.operation,
+        requestDigest: requestedDigest
+      ))
+    }
+    return record.retentionStatus
+  }
+
+  private func reconcilePendingRetentionIfNeeded(
+    operation: DesignDatabaseOperationReference,
+    requestDigest: ContentDigest
+  ) async throws(DesignDatabaseError) -> DesignRevisionRetentionSubmission? {
+    switch publicationState {
+    case .unresolvedRetention(let pending):
+      guard pending.record.operation == operation else {
+        return nil
+      }
+      guard pending.record.requestDigest == requestDigest else {
+        return .rejected(try retentionConflictRejection(
+          operation: operation,
+          requestDigest: requestDigest
+        ))
+      }
+      switch try await reconcilePendingRetention(pending) {
+      case .committed(let submission):
+        return submission
+      case .notCommitted:
+        return nil
+      case .outcomeUnknown(let unknown):
+        return .outcomeUnknown(unknown)
+      }
+    case .retentionInProgress(let pending):
+      guard pending.record.operation == operation else {
+        return nil
+      }
+      guard pending.record.requestDigest == requestDigest else {
+        return .rejected(try retentionConflictRejection(
+          operation: operation,
+          requestDigest: requestDigest
+        ))
+      }
+      throw .persistence(
+        "Retention operation \(operation.operationID.rawValue) is still in progress."
+      )
+    case .idle, .genericInProgress, .unresolvedGeneric:
+      return nil
+    }
+  }
+
+  private func persistRetentionRejection(
+    operation: DesignDatabaseOperationReference,
+    requestDigest: ContentDigest,
+    reason: DesignRevisionRetentionRejection.Reason
+  ) async throws(DesignDatabaseError) -> DesignRevisionRetentionSubmission {
+    let outcomeDigest = try DesignRevisionRetentionDigest.rejectedOutcome(
+      operation: operation,
+      requestDigest: requestDigest,
+      reason: reason,
+      using: digester
+    )
+    let rejection = DesignRevisionRetentionRejection(
+      operation: operation,
+      requestDigest: requestDigest,
+      reason: reason,
+      outcomeDigest: outcomeDigest
+    )
+    let record = DesignDatabaseOperationRecord(
+      operation: operation,
+      requestDigest: requestDigest,
+      outcome: .retentionRejected(rejection)
+    )
+    var proposedRecords = operationRecords
+    proposedRecords[operation] = record
+    return try await persistRetentionOperation(
+      record,
+      proposedClaims: retentionClaims,
+      proposedRecords: proposedRecords,
+      proposedReachabilityGeneration: reachabilityGeneration
+    )
+  }
+
+  private func persistRetentionOperation(
+    _ record: DesignDatabaseOperationRecord,
+    proposedClaims: [DesignRevisionRetentionID: DesignRevisionRetentionClaim],
+    proposedRecords: [
+      DesignDatabaseOperationReference: DesignDatabaseOperationRecord
+    ],
+    proposedReachabilityGeneration: UInt64
+  ) async throws(DesignDatabaseError) -> DesignRevisionRetentionSubmission {
+    try requirePublicationIdle()
+    let proposedPersistenceGeneration = try incrementedPersistenceGeneration()
+    let currentImage = image()
+    let proposedImage = image(
+      retentionClaims: proposedClaims,
+      operationRecords: proposedRecords,
+      persistenceGeneration: proposedPersistenceGeneration,
+      reachabilityGeneration: proposedReachabilityGeneration
+    )
+    let pending = NativePendingRetentionPublication(
+      record: record,
+      currentImage: currentImage,
+      proposedImage: proposedImage
+    )
+    guard let persistence else {
+      adopt(proposedImage)
+      return record.retentionSubmission
+    }
+    publicationState = .retentionInProgress(pending)
+    do {
+      try await persistence.persist(proposedImage, publishing: nil)
+      adopt(proposedImage)
+      publicationState = .idle
+      return record.retentionSubmission
+    } catch let persistenceError {
+      switch try await reconcilePendingRetention(pending) {
+      case .committed(let submission):
+        return submission
+      case .notCommitted:
+        throw persistenceError
+      case .outcomeUnknown(let unknown):
+        return .outcomeUnknown(unknown)
+      }
+    }
+  }
+
+  private func reconcilePendingRetention(
+    _ pending: NativePendingRetentionPublication
+  ) async throws(DesignDatabaseError) -> NativeRetentionReconciliation {
+    guard let persistence else {
+      publicationState = .unresolvedRetention(pending)
+      throw .corruption("Retention reconciliation has no persistence backend.")
+    }
+    publicationState = .retentionInProgress(pending)
+    let loadedImage: DesignDatabaseImage?
+    do {
+      loadedImage = try await persistence.load()
+    } catch let reconciliationError {
+      publicationState = .unresolvedRetention(pending)
+      switch reconciliationError {
+      case .corruption, .closed:
+        throw reconciliationError
+      default:
+        return .outcomeUnknown(
+          DesignRevisionRetentionUnknown(
+            operation: pending.record.operation,
+            requestDigest: pending.record.requestDigest
+          )
+        )
+      }
+    }
+    guard let loadedImage else {
+      publicationState = .unresolvedRetention(pending)
+      throw .corruption("The persistent database image disappeared during reconciliation.")
+    }
+
+    let reconciliation: NativeDesignDatabaseImageReconciliation
+    do {
+      reconciliation = try reconcile(
+        loadedImage,
+        currentImage: pending.currentImage,
+        proposedImage: pending.proposedImage
+      )
+    } catch {
+      publicationState = .unresolvedRetention(pending)
+      throw error
+    }
+    switch reconciliation {
+    case .committed:
+      adopt(loadedImage)
+      publicationState = .idle
+      return .committed(pending.record.retentionSubmission)
+    case .notCommitted:
+      publicationState = .idle
+      return .notCommitted
+    }
+  }
+
+  private func adopt(_ image: DesignDatabaseImage) {
+    revisions = image.revisions
+    references = image.references
+    retentionClaims = image.retentionClaims
+    operationRecords = image.operationRecords
+    persistenceGeneration = image.persistenceGeneration
+    reachabilityGeneration = image.reachabilityGeneration
+    nextEntityValue = image.nextEntityValue
+    snapshotCache = [:]
   }
 
   private func changeSet(
@@ -443,6 +1182,14 @@ public actor NativeDesignDatabase: DesignDatabase {
       )
     } catch {
       throw .corruption("Validated execution provenance could not be revision-scoped.")
+    }
+  }
+
+  private static func currentTimestamp() throws(DesignDatabaseError) -> ExecutionTimestamp {
+    do {
+      return try ExecutionTimestamp(Date())
+    } catch {
+      throw .corruption("The system clock produced a non-finite execution timestamp.")
     }
   }
 
@@ -648,6 +1395,155 @@ public actor NativeDesignDatabase: DesignDatabase {
         throw .corruption("A named reference targets an unavailable revision.")
       }
     }
+    guard image.persistenceGeneration > 0 else {
+      throw .corruption("Database persistence generation must be nonzero.")
+    }
+    guard image.reachabilityGeneration > 0,
+      image.persistenceGeneration >= image.reachabilityGeneration
+    else {
+      throw .corruption(
+        "Database reachability generation must be nonzero and cannot exceed persistence."
+      )
+    }
+    for (claimID, claim) in image.retentionClaims {
+      guard claim.claimID == claimID else {
+        throw .corruption("Retention claim dictionary key does not match its record.")
+      }
+      guard claim.revision.databaseID == image.databaseID,
+        image.revisions[claim.revision.revisionID] != nil
+      else {
+        throw .corruption("Retention claim targets an unavailable revision.")
+      }
+      switch claim.state {
+      case .active:
+        guard claim.generation == 1 else {
+          throw .corruption("Active retention claim must have generation 1.")
+        }
+      case .released:
+        guard claim.generation == 2 else {
+          throw .corruption("Released retention claim must have generation 2.")
+        }
+      }
+    }
+    var appliedReceiptsByClaim: [
+      DesignRevisionRetentionID: [DesignRevisionRetentionReceipt]
+    ] = [:]
+    for (operation, record) in image.operationRecords {
+      guard operation == record.operation else {
+        throw .corruption("Operation dictionary key does not match its record.")
+      }
+      guard operation.databaseID == image.databaseID else {
+        throw .corruption("Operation record belongs to a different database.")
+      }
+      switch record.outcome {
+      case .retentionApplied(let receipt):
+        guard receipt.operation == operation else {
+          throw .corruption("Retention receipt operation does not match its record.")
+        }
+        guard receipt.generation > 0,
+          receipt.reachabilityGeneration > 0,
+          receipt.reachabilityGeneration <= image.reachabilityGeneration
+        else {
+          throw .corruption("Retention receipt generation is invalid.")
+        }
+        guard let claim = image.retentionClaims[receipt.claimID],
+          claim.revision == receipt.revision,
+          claim.ownerSubjectScopeID == operation.authorizationSubjectScopeID,
+          receipt.generation <= claim.generation
+        else {
+          throw .corruption("Retention receipt does not match a retained claim.")
+        }
+        switch receipt.state {
+        case .active:
+          guard receipt.generation == 1 else {
+            throw .corruption("Active retention receipt has an invalid generation.")
+          }
+          let expectedRequestDigest = try DesignRevisionRetentionDigest.retainingRequest(
+            operationID: operation.operationID,
+            claimID: receipt.claimID,
+            revision: receipt.revision,
+            reason: claim.reason,
+            evidenceDigest: claim.evidenceDigest,
+            using: digester
+          )
+          guard record.requestDigest == expectedRequestDigest else {
+            throw .corruption("Retention activation request digest mismatch.")
+          }
+        case .released:
+          guard claim.state == .released,
+            claim.generation == 2,
+            receipt.generation == 2
+          else {
+            throw .corruption("Released retention receipt does not match its tombstone.")
+          }
+          let expectedRequestDigest = try DesignRevisionRetentionDigest.releasingRequest(
+            operationID: operation.operationID,
+            claimID: receipt.claimID,
+            expectedRevision: receipt.revision,
+            expectedGeneration: receipt.generation - 1,
+            using: digester
+          )
+          guard record.requestDigest == expectedRequestDigest else {
+            throw .corruption("Retention release request digest mismatch.")
+          }
+        }
+        let expectedOutcomeDigest = try DesignRevisionRetentionDigest.appliedOutcome(
+          operation: operation,
+          requestDigest: record.requestDigest,
+          claimID: receipt.claimID,
+          revision: receipt.revision,
+          generation: receipt.generation,
+          reachabilityGeneration: receipt.reachabilityGeneration,
+          state: receipt.state,
+          using: digester
+        )
+        guard receipt.outcomeDigest == expectedOutcomeDigest else {
+          throw .corruption("Retention receipt outcome digest mismatch.")
+        }
+        appliedReceiptsByClaim[receipt.claimID, default: []].append(receipt)
+      case .retentionRejected(let rejection):
+        guard rejection.operation == operation,
+          rejection.requestDigest == record.requestDigest
+        else {
+          throw .corruption("Retention rejection does not match its operation record.")
+        }
+        let expectedOutcomeDigest = try DesignRevisionRetentionDigest.rejectedOutcome(
+          operation: operation,
+          requestDigest: record.requestDigest,
+          reason: rejection.reason,
+          using: digester
+        )
+        guard rejection.outcomeDigest == expectedOutcomeDigest else {
+          throw .corruption("Retention rejection outcome digest mismatch.")
+        }
+      }
+    }
+    for (claimID, claim) in image.retentionClaims {
+      let receipts = appliedReceiptsByClaim[claimID] ?? []
+      let activations = receipts.filter { $0.state == .active }
+      let releases = receipts.filter { $0.state == .released }
+      guard activations.count == 1 else {
+        throw .corruption(
+          "Retention claim \(claimID.rawValue) must have exactly one activation outcome."
+        )
+      }
+      switch claim.state {
+      case .active:
+        guard releases.isEmpty else {
+          throw .corruption("Active retention claim has a release outcome.")
+        }
+      case .released:
+        guard releases.count == 1,
+          let activation = activations.first,
+          let release = releases.first,
+          activation.reachabilityGeneration < release.reachabilityGeneration
+        else {
+          throw .corruption(
+            "Released retention claim must have one ordered release outcome."
+          )
+        }
+      }
+    }
   }
 
   private static func uniquenessConflict(
@@ -679,5 +1575,43 @@ public actor NativeDesignDatabase: DesignDatabase {
       }
     }
     return nil
+  }
+}
+
+private enum NativeDesignDatabasePublicationState {
+  case idle
+  case genericInProgress
+  case retentionInProgress(NativePendingRetentionPublication)
+  case unresolvedGeneric
+  case unresolvedRetention(NativePendingRetentionPublication)
+}
+
+private struct NativePendingRetentionPublication {
+  let record: DesignDatabaseOperationRecord
+  let currentImage: DesignDatabaseImage
+  let proposedImage: DesignDatabaseImage
+}
+
+private enum NativeDesignDatabaseImageReconciliation {
+  case committed
+  case notCommitted
+}
+
+private enum NativeRetentionReconciliation {
+  case committed(DesignRevisionRetentionSubmission)
+  case notCommitted
+  case outcomeUnknown(DesignRevisionRetentionUnknown)
+}
+
+private extension DesignRevisionRetentionSubmission {
+  var status: DesignRevisionRetentionStatus {
+    switch self {
+    case .applied(let receipt):
+      return .applied(receipt)
+    case .rejected(let rejection):
+      return .rejected(rejection)
+    case .outcomeUnknown(let unknown):
+      return .outcomeUnknown(unknown)
+    }
   }
 }

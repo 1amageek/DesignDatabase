@@ -1,4 +1,4 @@
-public struct DesignQueryExecutionPolicy: Sendable, Hashable, Codable {
+public struct DesignQueryExecutionPolicy: Sendable, Hashable, DesignDatabaseSerializable {
   public let allowsFullScan: Bool
   public let maximumResultCount: UInt64
 

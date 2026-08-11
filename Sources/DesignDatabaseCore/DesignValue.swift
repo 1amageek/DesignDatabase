@@ -1,6 +1,6 @@
 import CircuiteFoundation
 
-public enum DesignValue: Sendable, Hashable, Codable {
+public enum DesignValue: Sendable, Hashable, DesignDatabaseSerializable {
   case signed(Int64)
   case unsigned(UInt64)
   case real(Double)
@@ -9,6 +9,7 @@ public enum DesignValue: Sendable, Hashable, Codable {
   case digest(ContentDigest)
   case entity(DesignEntityKey)
 
+#if DESIGN_DATABASE_FOUNDATION_SERIALIZATION
   public init(from decoder: any Decoder) throws {
     let container = try decoder.container(keyedBy: CodingKeys.self)
     switch try container.decode(Kind.self, forKey: .kind) {
@@ -26,7 +27,9 @@ public enum DesignValue: Sendable, Hashable, Codable {
     case .entity: self = .entity(try container.decode(DesignEntityKey.self, forKey: .entity))
     }
   }
+#endif
 
+#if DESIGN_DATABASE_FOUNDATION_SERIALIZATION
   public func encode(to encoder: any Encoder) throws {
     var container = encoder.container(keyedBy: CodingKeys.self)
     switch self {
@@ -56,12 +59,15 @@ public enum DesignValue: Sendable, Hashable, Codable {
       try container.encode(value, forKey: .entity)
     }
   }
+#endif
 
-  private enum Kind: String, Codable {
+  private enum Kind: String, DesignDatabaseSerializable {
     case signed, unsigned, real, boolean, string, digest, entity
   }
 
+#if DESIGN_DATABASE_FOUNDATION_SERIALIZATION
   private enum CodingKeys: String, CodingKey {
     case kind, signed, unsigned, real, boolean, string, digest, entity
   }
+#endif
 }

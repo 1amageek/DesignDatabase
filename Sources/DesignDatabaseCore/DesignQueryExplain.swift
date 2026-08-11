@@ -1,4 +1,4 @@
-public struct DesignQueryExplain: Sendable, Hashable, Codable {
+public struct DesignQueryExplain: Sendable, Hashable, DesignDatabaseSerializable {
   public let selectedIndex: DesignIndexKind
   public let estimatedScanCount: UInt64
   public let admittedFullScan: Bool

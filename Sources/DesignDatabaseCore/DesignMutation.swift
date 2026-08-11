@@ -1,6 +1,6 @@
 import CircuiteFoundation
 
-public enum DesignMutation: Sendable, Hashable, Codable {
+public enum DesignMutation: Sendable, Hashable, DesignDatabaseSerializable {
   case create(facet: DesignFacetID, kind: DesignEntityKindID, requestedID: DesignEntityID?)
   case delete(DesignEntityKey)
   case setField(entity: DesignEntityKey, field: DesignFieldID, value: DesignValue?)

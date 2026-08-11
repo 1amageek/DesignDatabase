@@ -1,4 +1,4 @@
-public struct DesignIntegerBounds: Sendable, Hashable, Codable {
+public struct DesignIntegerBounds: Sendable, Hashable, DesignDatabaseSerializable {
   public let minimumX: Int64
   public let minimumY: Int64
   public let maximumX: Int64
@@ -29,6 +29,7 @@ public struct DesignIntegerBounds: Sendable, Hashable, Codable {
       && maximumX >= other.maximumX && maximumY >= other.maximumY
   }
 
+#if DESIGN_DATABASE_FOUNDATION_SERIALIZATION
   public init(from decoder: any Decoder) throws {
     let container = try decoder.container(keyedBy: CodingKeys.self)
     try self.init(
@@ -38,8 +39,11 @@ public struct DesignIntegerBounds: Sendable, Hashable, Codable {
       maximumY: container.decode(Int64.self, forKey: .maximumY)
     )
   }
+#endif
 
+#if DESIGN_DATABASE_FOUNDATION_SERIALIZATION
   private enum CodingKeys: String, CodingKey {
     case minimumX, minimumY, maximumX, maximumY
   }
+#endif
 }

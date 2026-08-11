@@ -1,4 +1,4 @@
-public struct DesignQueryResult: Sendable, Codable {
+public struct DesignQueryResult: Sendable, DesignDatabaseSerializable {
   public let records: [DesignEntityRecord]
   public let explain: DesignQueryExplain
 

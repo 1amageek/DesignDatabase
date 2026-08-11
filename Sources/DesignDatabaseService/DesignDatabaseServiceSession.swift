@@ -1,72 +1,78 @@
 import CircuiteFoundation
 import DesignDatabaseCore
 
-public actor DesignDatabaseServiceSession {
-  public nonisolated let databaseID: DesignDatabaseID
+public protocol DesignDatabaseServiceSession: Sendable {
+  var id: DesignDatabaseServiceSessionID { get }
+  var databaseID: DesignDatabaseID { get }
+  var authorizationSubjectScopeID: DesignAuthorizationSubjectScopeID { get }
+  var featureCapabilities: DesignCapabilitySet { get }
+  var authorizationGrants: DesignDatabaseAuthorizationGrantSet { get }
+  var genesisRevision: DesignRevisionReference { get }
 
-  private let database: any DesignDatabase
-  private let clock: ContinuousClock
-  private let expiresAt: ContinuousClock.Instant
-  private var isClosed: Bool
-
-  public init(
-    database: any DesignDatabase,
-    leaseDuration: Duration
-  ) throws(DesignDatabaseError) {
-    guard leaseDuration > .zero else {
-      throw DesignDatabaseError.invalidQuery("Session lease duration must be positive.")
-    }
-    let clock = ContinuousClock()
-    self.databaseID = database.databaseID
-    self.database = database
-    self.clock = clock
-    self.expiresAt = clock.now.advanced(by: leaseDuration)
-    self.isClosed = false
-  }
-
-  public func resolve(
+  func resolve(
     _ selector: DesignRevisionSelector
-  ) async throws(DesignDatabaseError) -> DesignRevisionReference {
-    try requireActive()
-    return try await database.resolve(selector)
-  }
+  ) async throws(DesignDatabaseServiceError) -> DesignRevisionReference
 
-  public func query(
-    revision: DesignRevisionReference,
-    query: DesignQuery
-  ) async throws(DesignDatabaseError) -> DesignQueryResult {
-    try requireActive()
-    let snapshot = try await database.snapshot(at: revision)
-    return try snapshot.execute(query)
-  }
-
-  public func manifest(
+  func openSnapshot(
     at revision: DesignRevisionReference
-  ) async throws(DesignDatabaseError) -> DesignRevisionManifest {
-    try requireActive()
-    return try await database.manifest(at: revision)
-  }
+  ) async throws(DesignDatabaseServiceError)
+    -> DesignDatabaseServiceSnapshotDescriptor
 
-  public func apply(
-    _ batch: DesignMutationBatch,
-    from base: DesignRevisionReference,
-    options: DesignTransactionOptions
-  ) async throws(DesignDatabaseError) -> DesignTransactionResult<Void> {
-    try requireActive()
-    return try await database.withTransaction(
-      from: base,
-      options: options,
-      { (transaction: inout DesignTransaction) throws(DesignDatabaseError) -> Void in
-        try transaction.apply(batch)
-      }
-    )
-  }
+  func closeSnapshot(
+    _ snapshotID: DesignDatabaseServiceSnapshotID
+  ) async throws(DesignDatabaseServiceError) -> DesignSnapshotTermination
 
-  public func shutdown() {
-    isClosed = true
-  }
+  func query(
+    snapshotID: DesignDatabaseServiceSnapshotID,
+    request: DesignQueryRequest
+  ) async throws(DesignDatabaseServiceError) -> DesignQueryPage
 
-  private func requireActive() throws(DesignDatabaseError) {
-    guard !isClosed, clock.now < expiresAt else { throw .closed }
-  }
+  func diff(
+    _ request: DesignRevisionDiffRequest
+  ) async throws(DesignDatabaseServiceError) -> DesignRevisionDiff
+
+  func assessDisjointMerge(
+    _ request: DesignDisjointMergeRequest
+  ) async throws(DesignDatabaseServiceError) -> DesignDisjointMergeAssessment
+
+  func publishDisjointMerge(
+    _ submission: DesignDisjointMergePublicationSubmission
+  ) async throws(DesignDatabaseServiceError) -> DesignDisjointMergePublicationResult
+
+  func disjointMergePublicationStatus(
+    operation: DesignDatabaseOperationReference,
+    requestDigest: ContentDigest
+  ) async throws(DesignDatabaseServiceError) -> DesignDisjointMergePublicationStatus
+
+  func submit(
+    _ submission: DesignCommitSubmission
+  ) async throws(DesignDatabaseServiceError) -> DesignCommitResult
+
+  func commitStatus(
+    operation: DesignDatabaseOperationReference,
+    requestDigest: ContentDigest
+  ) async throws(DesignDatabaseServiceError) -> DesignCommitStatus
+
+  func compareAndSetReference(
+    _ request: DesignReferenceUpdateRequest
+  ) async throws(DesignDatabaseServiceError) -> DesignReferenceUpdateResult
+
+  func referenceStatus(
+    operation: DesignDatabaseOperationReference,
+    requestDigest: ContentDigest
+  ) async throws(DesignDatabaseServiceError) -> DesignReferenceUpdateStatus
+
+  func retain(
+    _ request: DesignRevisionRetentionRequest
+  ) async throws(DesignDatabaseServiceError) -> DesignRevisionRetentionSubmission
+
+  func releaseRetention(
+    _ request: DesignRevisionRetentionReleaseRequest
+  ) async throws(DesignDatabaseServiceError) -> DesignRevisionRetentionSubmission
+
+  func retentionStatus(
+    operation: DesignDatabaseOperationReference,
+    requestDigest: ContentDigest
+  ) async throws(DesignDatabaseServiceError) -> DesignRevisionRetentionStatus
+
 }

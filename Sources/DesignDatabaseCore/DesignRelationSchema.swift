@@ -1,6 +1,6 @@
 import CircuiteFoundation
 
-public struct DesignRelationSchema: Sendable, Hashable, Codable {
+public struct DesignRelationSchema: Sendable, Hashable, DesignDatabaseSerializable {
   public let id: DesignRelationKindID
   public let targetFacets: Set<DesignFacetID>
   public let isHierarchyParent: Bool

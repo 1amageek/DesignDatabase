@@ -1,4 +1,4 @@
-public struct DesignMutationBatch: Sendable, Hashable, Codable {
+public struct DesignMutationBatch: Sendable, Hashable, DesignDatabaseSerializable {
   public let mutations: [DesignMutation]
 
   public init(mutations: [DesignMutation]) {

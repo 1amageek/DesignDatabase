@@ -1,4 +1,4 @@
-public enum DesignIndexKind: String, Sendable, Hashable, Codable, CaseIterable {
+public enum DesignIndexKind: String, Sendable, Hashable, DesignDatabaseSerializable, CaseIterable {
   case entity
   case facet
   case name

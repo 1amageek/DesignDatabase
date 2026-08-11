@@ -1,4 +1,6 @@
 import CircuiteFoundation
+import CircuiteFoundationCrypto
+import CircuiteFoundationFoundation
 import DesignDatabaseCore
 @testable import DesignDatabaseNative
 import Foundation
@@ -9,7 +11,7 @@ struct NativeDesignDatabaseTests {
   @Test
   func transactionProducesExactImmutableCandidateAndCASPromotion() async throws {
     let fixture = try makeFixture()
-    let database = try await NativeDesignDatabaseProvider().create(fixture.request)
+    let database = try await makeProvider().create(fixture.request)
     let root = try await database.resolve(.named(.main))
     let options = try DesignTransactionOptions()
 
@@ -52,7 +54,7 @@ struct NativeDesignDatabaseTests {
   @Test
   func requiredFieldFailurePublishesNoRevision() async throws {
     let fixture = try makeFixture()
-    let database = try await NativeDesignDatabaseProvider().create(fixture.request)
+    let database = try await makeProvider().create(fixture.request)
     let root = try await database.resolve(.named(.main))
 
     await #expect(throws: DesignDatabaseError.self) {
@@ -70,7 +72,7 @@ struct NativeDesignDatabaseTests {
   @Test
   func uniqueConstraintRejectsDuplicateCompositeKeyWithoutPublishing() async throws {
     let fixture = try makeFixture()
-    let database = try await NativeDesignDatabaseProvider().create(fixture.request)
+    let database = try await makeProvider().create(fixture.request)
     let root = try await database.resolve(.named(.main))
 
     await #expect(throws: DesignDatabaseError.self) {
@@ -126,14 +128,14 @@ struct NativeDesignDatabaseTests {
     let schemaDigests = Dictionary(uniqueKeysWithValues: fixture.request.schemas.map {
       ($0.descriptor.schemaID, $0.descriptor.canonicalDigest)
     })
-    let manifest = DesignRevisionManifest(
+    let manifest = DesignReferenceRevisionManifest(
       revision: revision,
       parents: [],
       stateDigest: stateDigest,
       schemaDigests: schemaDigests,
       changeSetDigest: changeDigest,
       provenance: nil,
-      createdAt: Date(timeIntervalSince1970: 1)
+      createdAt: try ExecutionTimestamp(Date(timeIntervalSince1970: 1))
     )
     let image = DesignDatabaseImage(
       databaseID: databaseID,
@@ -151,14 +153,21 @@ struct NativeDesignDatabaseTests {
     )
 
     #expect(throws: DesignDatabaseError.self) {
-      _ = try NativeDesignDatabase(image: image, validators: [])
+      let authorization = try makeAuthorization()
+      _ = try NativeDesignDatabase(
+        image: image,
+        validators: [],
+        authorizationSubjectScopeID: authorization.subjectScopeID,
+        authorizationGrants: authorization.grants,
+        authorizer: authorization.authority
+      )
     }
   }
 
   @Test
   func transactionManifestScopesProvenanceToBaseAndCandidate() async throws {
     let fixture = try makeFixture()
-    let database = try await NativeDesignDatabaseProvider().create(fixture.request)
+    let database = try await makeProvider().create(fixture.request)
     let root = try await database.resolve(.named(.main))
     let instant = Date(timeIntervalSince1970: 1)
     let source = try ExecutionProvenance(
@@ -188,7 +197,7 @@ struct NativeDesignDatabaseTests {
   @Test
   func indexedSpatialQueryReportsPlanAndFindsRecord() async throws {
     let fixture = try makeFixture()
-    let database = try await NativeDesignDatabaseProvider().create(fixture.request)
+    let database = try await makeProvider().create(fixture.request)
     let root = try await database.resolve(.named(.main))
     let result = try await database.withTransaction(
       from: root,
@@ -243,7 +252,7 @@ struct NativeDesignDatabaseTests {
   @Test
   func hierarchyAndConnectivityQueriesUseImmutableIndexes() async throws {
     let fixture = try makeFixture()
-    let database = try await NativeDesignDatabaseProvider().create(fixture.request)
+    let database = try await makeProvider().create(fixture.request)
     let root = try await database.resolve(.named(.main))
     let result = try await database.withTransaction(
       from: root,
@@ -341,8 +350,8 @@ struct NativeDesignDatabaseTests {
   @Test
   func crossDatabaseReferenceFailsExplicitly() async throws {
     let fixture = try makeFixture()
-    let first = try await NativeDesignDatabaseProvider().create(fixture.request)
-    let second = try await NativeDesignDatabaseProvider().create(fixture.request)
+    let first = try await makeProvider(scopeLow: 1).create(fixture.request)
+    let second = try await makeProvider(scopeLow: 2).create(fixture.request)
     let foreign = try await second.resolve(.named(.main))
 
     await #expect(throws: DesignDatabaseError.self) {
@@ -353,9 +362,92 @@ struct NativeDesignDatabaseTests {
   }
 
   @Test
+  func requestedGrantEscalationFailsBeforeDatabaseCreation() async throws {
+    let fixture = try makeFixture()
+    let subjectScopeID = try DesignAuthorizationSubjectScopeID(
+      high: 0x444442,
+      low: 10
+    )
+    let authority = NativeDesignDatabaseAuthorizationAuthority(
+      grantsBySubjectScope: [
+        subjectScopeID: DesignDatabaseAuthorizationGrantSet([.read])
+      ]
+    )
+    let provider = NativeDesignDatabaseProvider(
+      authorizationSubjectScopeID: subjectScopeID,
+      requestedAuthorization: DesignDatabaseAuthorizationGrantSet([
+        .read,
+        .proposeCandidate,
+      ]),
+      authorizer: authority
+    )
+
+    await #expect(throws: DesignDatabaseError.self) {
+      _ = try await provider.create(fixture.request)
+    }
+  }
+
+  @Test
+  func authorizationIsRevalidatedForEachProtectedOperation() async throws {
+    let fixture = try makeFixture()
+    let subjectScopeID = try DesignAuthorizationSubjectScopeID(
+      high: 0x444442,
+      low: 11
+    )
+    let initialGrants = DesignDatabaseAuthorizationGrantSet([
+      .read,
+      .proposeCandidate,
+    ])
+    let authority = NativeDesignDatabaseAuthorizationAuthority(
+      grantsBySubjectScope: [subjectScopeID: initialGrants]
+    )
+    let database = try await NativeDesignDatabaseProvider(
+      authorizationSubjectScopeID: subjectScopeID,
+      requestedAuthorization: initialGrants,
+      authorizer: authority
+    ).create(fixture.request)
+    let root = try await database.resolve(.named(.main))
+
+    await authority.replaceGrants(
+      DesignDatabaseAuthorizationGrantSet([.read]),
+      for: subjectScopeID
+    )
+
+    await #expect(throws: DesignDatabaseError.self) {
+      _ = try await database.withTransaction(
+        from: root,
+        options: try DesignTransactionOptions()
+      ) { (transaction: inout DesignTransaction) throws(DesignDatabaseError) -> Void in
+        let entity = try transaction.createEntity(
+          facet: fixture.facet,
+          kind: fixture.kind
+        )
+        try transaction.setField(
+          entity: DesignEntityKey(
+            databaseID: root.databaseID,
+            entityID: entity
+          ),
+          field: fixture.nameField,
+          value: .string("unauthorized")
+        )
+      }
+    }
+    #expect(try await database.resolve(.named(.main)) == root)
+
+    await authority.replaceGrants(
+      DesignDatabaseAuthorizationGrantSet([]),
+      for: subjectScopeID
+    )
+    await #expect(throws: DesignDatabaseError.self) {
+      _ = try await database.resolve(.named(.main))
+    }
+    try await database.close()
+  }
+
+  @Test
   func unavailableIndexRequiresExplicitFullScanAdmission() async throws {
     let fixture = try makeFixture(indexes: [.name])
-    let database = try await NativeDesignDatabaseProvider().create(fixture.request)
+    let database = try await makeProvider().create(fixture.request)
     let root = try await database.resolve(.named(.main))
     let result = try await database.withTransaction(
       from: root,
@@ -395,6 +487,36 @@ struct NativeDesignDatabaseTests {
     #expect(admitted.explain.admittedFullScan)
     #expect(admitted.explain.estimatedScanCount == 2)
     try await database.close()
+  }
+
+  private func makeProvider(
+    scopeLow: UInt64 = 1
+  ) throws -> NativeDesignDatabaseProvider {
+    let authorization = try makeAuthorization(scopeLow: scopeLow)
+    return NativeDesignDatabaseProvider(
+      authorizationSubjectScopeID: authorization.subjectScopeID,
+      requestedAuthorization: authorization.grants,
+      authorizer: authorization.authority
+    )
+  }
+
+  private func makeAuthorization(
+    scopeLow: UInt64 = 1
+  ) throws -> AuthorizationFixture {
+    let subjectScopeID = try DesignAuthorizationSubjectScopeID(
+      high: 0x444442,
+      low: scopeLow
+    )
+    let grants = DesignDatabaseAuthorizationGrantSet(
+      DesignDatabaseAuthorizationGrant.allCases
+    )
+    return AuthorizationFixture(
+      subjectScopeID: subjectScopeID,
+      grants: grants,
+      authority: NativeDesignDatabaseAuthorizationAuthority(
+        grantsBySubjectScope: [subjectScopeID: grants]
+      )
+    )
   }
 
   private func makeFixture(
@@ -455,7 +577,7 @@ struct NativeDesignDatabaseTests {
       connectivityRelation: connectivityRelation,
       crossFacetRelation: crossFacetRelation,
       dependencyRelation: dependencyRelation,
-      request: DesignDatabaseCreateRequest(
+      request: DesignReferenceDatabaseCreateRequest(
         schemas: [schema],
         capabilities: try DesignCapabilitySet([])
       )
@@ -470,6 +592,12 @@ struct NativeDesignDatabaseTests {
     let connectivityRelation: DesignRelationKindID
     let crossFacetRelation: DesignRelationKindID
     let dependencyRelation: DesignRelationKindID
-    let request: DesignDatabaseCreateRequest
+    let request: DesignReferenceDatabaseCreateRequest
+  }
+
+  private struct AuthorizationFixture {
+    let subjectScopeID: DesignAuthorizationSubjectScopeID
+    let grants: DesignDatabaseAuthorizationGrantSet
+    let authority: NativeDesignDatabaseAuthorizationAuthority
   }
 }

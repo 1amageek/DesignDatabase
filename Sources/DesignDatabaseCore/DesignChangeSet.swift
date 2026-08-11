@@ -1,6 +1,6 @@
 import CircuiteFoundation
 
-public struct DesignChangeSet: Sendable, Hashable, Codable {
+public struct DesignChangeSet: Sendable, Hashable, DesignDatabaseSerializable {
   public let baseRevision: DesignRevisionReference
   public let targetRevision: DesignRevisionReference
   public let changes: [DesignEntityChange]

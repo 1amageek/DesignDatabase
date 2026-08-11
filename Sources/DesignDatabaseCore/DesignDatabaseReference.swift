@@ -1,8 +1,10 @@
 import CircuiteFoundation
 
-public protocol DesignDatabase: Sendable {
+public protocol DesignDatabaseReference: Sendable {
   var databaseID: DesignDatabaseID { get }
   var capabilities: DesignCapabilitySet { get }
+  var authorizationSubjectScopeID: DesignAuthorizationSubjectScopeID { get }
+  var authorizationGrants: DesignDatabaseAuthorizationGrantSet { get }
 
   func resolve(
     _ selector: DesignRevisionSelector
@@ -10,11 +12,11 @@ public protocol DesignDatabase: Sendable {
 
   func snapshot(
     at revision: DesignRevisionReference
-  ) async throws(DesignDatabaseError) -> DesignReadSnapshot
+  ) async throws(DesignDatabaseError) -> DesignReferenceReadSnapshot
 
   func manifest(
     at revision: DesignRevisionReference
-  ) async throws(DesignDatabaseError) -> DesignRevisionManifest
+  ) async throws(DesignDatabaseError) -> DesignReferenceRevisionManifest
 
   func withTransaction<Result: Sendable>(
     from base: DesignRevisionReference,
@@ -27,6 +29,19 @@ public protocol DesignDatabase: Sendable {
     expected: DesignRevisionReference?,
     desired: DesignRevisionReference
   ) async throws(DesignDatabaseError) -> DesignReferenceUpdate
+
+  func retain(
+    _ request: DesignRevisionRetentionRequest
+  ) async throws(DesignDatabaseError) -> DesignRevisionRetentionSubmission
+
+  func releaseRetention(
+    _ request: DesignRevisionRetentionReleaseRequest
+  ) async throws(DesignDatabaseError) -> DesignRevisionRetentionSubmission
+
+  func retentionStatus(
+    operation: DesignDatabaseOperationReference,
+    requestDigest: ContentDigest
+  ) async throws(DesignDatabaseError) -> DesignRevisionRetentionStatus
 
   func close() async throws(DesignDatabaseError)
 }

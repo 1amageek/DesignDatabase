@@ -1,440 +1,496 @@
 # DesignDatabase Design
 
-Status: normative architecture with an executable safe reference backend. Sections 4-7, the in-memory forms of
-the required indexes, candidate publication, full-image WAL recovery, and in-process negotiation are implemented.
-Sections describing pages, immutable storage segments, zero-copy batches, remote transport, compaction, schema
-generation, OpenDB binary bindings, and the external client remain target architecture rather than current behavior.
-The neutral OpenDB object/property/relation adapter is implemented in the sibling `EDAInteroperability` package.
+Status: normative target design with executable Native reference and partial framework Runtime.
+
+The current package implements immutable reference revisions, closure-based reference
+transactions, exact in-memory snapshots, nine in-memory projection families,
+revalidated authorization grants, subject-scoped operation identity, and a Native
+operation-identified retention lifecycle with canonical request/outcome digests and
+exact-image reconciliation, full-image WAL recovery, and an in-process service. The
+framework-backed production Runtime now provides immutable plan admission, atomic
+candidate/reference/retention operations, canonical facet-root manifests, and exact
+closure-scoped Runtime reads. Persistent semantic projection pages, domain adapters,
+exact workspace dependency resolution, production-qualified remote service, and retained circuit-scale
+performance evidence are not implemented. Xcircuite's secret-free schema-v4 mount
+catalog and first managed-local provider/session activation are implemented separately.
+
+The normative companion documents are:
+
+- `DATABASE_FRAMEWORK_RUNTIME_ARCHITECTURE.md`: fixed framework integration and
+  persistent Runtime;
+- `SCHEMA_ADAPTER_ARCHITECTURE.md`: domain schema, validation, and interoperability
+  boundaries;
+- `INTERFACES.md`: target public API contracts;
+- `REQUIREMENTS.md`: implementation and evidence requirements;
+- `../DESIGN_WORKSPACE_ARCHITECTURE.md`: project/database granularity, mounts,
+  dependency graph, ECO, and multi-database release.
 
 ## 1. Purpose
 
-`DesignDatabase` owns the canonical working state used while a design is edited and analyzed. Every observable
-state is an immutable revision. Mutation occurs only through an explicit transaction that produces a candidate
-revision. Standard artifacts remain authoritative at interchange, independent verification, and release
-boundaries.
+DesignDatabase is the canonical working-state store for one independently versioned,
+approved, released, retained, and permissioned design unit.
+
+Every observable design state is an immutable exact revision. A mutation is an
+immutable plan bound to one database, one base revision, one schema root, and one direct
+dependency root. A successful commit produces a candidate revision; it does not approve
+or release that candidate.
 
 ```mermaid
 flowchart LR
-  StandardIn["SPICE / LEF / DEF / OASIS / GDSII / SPEF"] --> Adapter["Domain Import Adapter"]
-  Adapter --> Transaction["Design Transaction"]
-  Transaction --> Candidate["Candidate Revision"]
-  Candidate --> Engines["Domain Engines"]
-  Engines --> Evidence["Diagnostics / Evidence / Typed Patch"]
-  Evidence --> Review["DesignFlowKernel / Human Review"]
-  Review --> Head["Promoted Named Reference"]
-  Head --> StandardOut["Deterministic Standard Export"]
+  Snapshot["Exact Base Snapshot"] --> Engine["Domain Engine"]
+  Dependencies["Exact Dependency Snapshots"] --> Engine
+  Engine --> Plan["One-database Immutable Plan"]
+  Plan --> Commit["DesignDatabaseRuntime"]
+  Commit --> Candidate["Candidate Revision"]
+  Candidate --> Evidence["Verification Evidence"]
+  Evidence --> Approval["DesignFlowKernel / Human"]
+  Approval --> Ref["Authorized Named-reference CAS"]
 ```
+
+Standard artifacts remain authoritative at interchange, independent verification, and
+release boundaries.
 
 ## 2. Ownership Boundary
 
 | Concern | Owner |
 |---|---|
-| Shared IDs, schema / capability values, artifact / provenance values | `CircuiteFoundation` |
-| Snapshot, transaction, revision DAG, query and storage | `DesignDatabase` |
-| Logical semantics | `LogicDesign` |
-| Technology semantics | `PDKKit` |
-| Geometry and layout semantics | `semiconductor-layout` and physical model packages |
-| Parasitic semantics | `PEXEngine` |
-| Timing semantics | `TimingEngine` |
-| OpenDB object conversion | `EDAInteroperability/OpenDBInteroperability` |
-| OpenROAD artifact/process compatibility | `EDAInteroperability/OpenROADInteroperability` |
-| Native placement / routing / CTS semantics | `PhysicalDesignEngine` |
-| Approval and resume | `DesignFlowKernel` |
-| Project and run composition | `Xcircuite` |
+| Shared exact identities, content identity, evidence, diagnostics, and provenance | `CircuiteFoundation` |
+| Generic values and model/query/schema declarations | `database-types` and `database-kit` |
+| Generic transactions, model persistence, query/index execution, migrations, and service execution | Fixed public API of `database-framework` |
+| Physical backend persistence | `storage-kit`, reached only through the framework |
+| Design revision DAG, exact snapshots, direct dependency lock, semantic pages, and named-reference CAS | `DesignDatabase` |
+| Database-independent domain meaning and pure validation | Domain package |
+| Database representation, cross-facet constraints, and overlay validation adaptation | Domain database schema target |
+| Project mounts, provider profiles, credentials, artifact availability, and resolved dependency graph | `Xcircuite` |
+| Approval, waiver, and resume | `DesignFlowKernel` |
+| Multi-database release authorization and tapeout bundle | `ReleaseEngine` |
+| OpenDB/OpenROAD/XLS mapping and loss evidence | `EDAInteroperability` |
 
-`DesignDatabase` does not import a domain package. It stores registered facet schemas and calls adapter-provided
-validation / projection through Core protocols. It never interprets a cell, net, layer, waveguide, timing path, or
-DRC violation by name.
+DesignDatabase does not import a domain package in Core or Runtime. Domain integrations
+are separate host-only packages. It does not modify `database-framework`, call
+`storage-kit` directly, or implement a second generic database runtime.
 
-## 3. Package Structure
+## 3. Database Unit
 
-```text
-DesignDatabase/
-├── Sources/
-│   ├── DesignDatabaseCore/
-│   ├── DesignDatabaseNative/
-│   ├── DesignDatabasePersistence/
-│   ├── DesignDatabaseService/
-│   ├── DesignDatabaseSchemaCompiler/
-│   ├── DesignDatabaseCLI/
-│   └── DesignDatabaseTesting/
-├── Tests/
-│   ├── DesignDatabaseCoreTests/
-│   ├── DesignDatabaseNativeTests/
-│   ├── DesignDatabasePersistenceTests/
-│   ├── DesignDatabaseServiceTests/
-│   └── DesignDatabasePerformanceTests/
-└── Benchmarks/
-```
+A database is not a UI project and not one domain facet.
 
-The OpenDB adapter is a separate package so Core, Native, WASM, and Embedded consumers never acquire a C++ or
-OpenROAD dependency transitively. Its implemented pure mapping does not link either external project.
+Use one database for state that must:
 
-## 4. Database Object Model
+- commit and validate atomically;
+- share one owner and permission boundary;
+- be reviewed and released together;
+- retain one coherent identity and revision history.
 
-A database contains immutable metadata and a DAG of immutable revisions.
+Use separate databases for independently released blocks, macros, libraries, PDKs,
+dies, chiplets, or package assemblies. Logical, physical, parasitic, timing, and DFT
+facets belonging to one block remain together.
+
+Xcircuite may mount multiple databases, but each mutating command selects exactly one
+database and exact base revision.
+
+## 4. Object Model
 
 ```text
 DesignDatabase
-├── databaseID
-├── creation schema set
-├── capability set
+├── database catalog and feature-capability profile
+├── exact schema bundles
+├── immutable revisions
+│   └── DesignRevisionManifest
+│       ├── parents
+│       ├── state digest
+│       ├── schema root
+│       ├── direct dependency root
+│       ├── facet roots
+│       ├── projection semantic descriptors/digests
+│       ├── direct change root
+│       └── provenance
+├── physical materialization bindings/generations
+├── revision/materialization lifecycle and collection intents
 ├── named references
-│   ├── main
-│   ├── candidate/<run-id>
-│   └── checkpoint/<name>
-└── revisions
-    └── DesignRevisionManifest
-        ├── revisionID
-        ├── parents
-        ├── stateDigest
-        ├── facet roots
-        ├── index roots
-        ├── changeSetDigest
-        └── provenance references
+├── operation receipts
+└── active/released retention claim records and operation outcomes
 ```
 
-`DesignRevisionID` is identity. `stateDigest` verifies canonical state bytes. They are deliberately separate.
-Two revisions may contain identical state while retaining different lineage and identity.
+`DesignRevisionID` is lineage identity. `stateDigest` verifies canonical content. Two
+revisions may have identical content while preserving distinct lineage.
 
-### Entity identity
+## 5. Identity
 
-- `DesignEntityID` is unique and never reused within one `DesignDatabaseID`.
-- deletion creates a tombstone in change history; it does not free the ID for another entity.
-- exact resolution requires `DesignEntityReference` including revision and facet.
-- hot-path access uses a revision-scoped compact `EntityHandle<T>` that is not persistent or `Codable`.
-- OpenDB OIDs and other external identifiers use a scoped mapping table and never become native entity IDs.
+- `DesignDatabaseID` identifies one database across provider relocation.
+- `DesignEntityID` and relation-occurrence ID are database-scoped, nonzero, and never
+  reused.
+- `DesignRevisionReference` always carries database and revision identity.
+- `DesignEntityReference` always carries exact revision, facet, kind, and entity.
+- Cross-database entity bindings explicitly name a dependency-lock entry and exact
+  `DesignEntityReference`; they never become intra-database entity IDs.
+- Hot-path handles are snapshot-local, non-persistent, and non-`Codable`.
+- External IDs such as OpenDB OIDs remain scoped external identities with explicit
+  mapping evidence.
 
-## 5. Facet Architecture
+## 6. Direct Dependency Lock
 
-Each domain adapter registers a facet descriptor before the first revision that uses it.
+Each revision stores an immutable direct dependency root. It contains:
 
-```mermaid
-flowchart LR
-  Schema["Facet Schema Descriptor"] --> Registry["Facet Registry"]
-  Registry --> Tables["Typed Tables / Columns"]
-  Registry --> Relations["Typed Relations"]
-  Registry --> Indexes["Index Declarations"]
-  Registry --> Validation["Validation Hooks"]
-  Registry --> Invalidations["Dependency / Invalidation Rules"]
-```
+- stable dependency ID and semantic role;
+- exact design revision or location-independent artifact content identity;
+- required schema and feature-capability contracts;
+- exact interface/abstract-view digest;
+- retention evidence.
 
-| Facet | Semantic owner | Representative entities |
+It contains no provider profile, path, URL, endpoint, credential, cache location, or
+mutable named selector. The root is included in the revision state digest.
+
+DesignDatabase validates the lock structure and plan binding. Xcircuite resolves the
+transitive graph and availability. ReleaseEngine verifies the complete resolved graph
+for release. No layer silently resolves `latest`.
+
+## 7. Facet Model
+
+| Facet | Semantic owner | Representative state |
 |---|---|---|
-| Logical | `LogicDesign` | module, instance, net, pin, port |
+| Logical | `LogicDesign` | module, instance, net, port, pin |
 | Technology | `PDKKit` | process, layer, via, site, library |
-| Physical | layout / physical model | block, row, placement, shape, route, via |
-| Parasitic | `PEXEngine` | network, node, R/C/L element, corner |
-| Timing | `TimingEngine` | constraint binding, derived timing annotation |
+| Physical | layout and physical packages | block, placement, shape, route, via |
+| Parasitic | `PEXEngine` | network, node, R/C/L, corner |
+| Timing | `TimingEngine` | constraint binding and derived annotation |
 | DFT | `DFTEngine` | scan chain, test point, BIST association |
 | Photonic | future photonic package | waveguide, optical port, mode, wavelength model |
-| Assembly | future 3D/package package | die, chiplet, bump, bond, interposer |
+| Assembly | future 3D/package package | die, bump, bond, interposer |
 
-A facet schema declares fixed fields and relations. A free-form property bag is not the canonical representation.
-Unknown external properties are retained in a namespaced extension table with an explicit schema / loss report.
+Each domain integration provides:
 
-Schema registration is immutable for a revision. Adding or upgrading a facet produces a new revision after
-compatibility validation; it never mutates the meaning of an existing revision.
+- exact framework model/schema contribution;
+- stable facet bindings;
+- typed read projection;
+- import/export plan builders;
+- database representation and cross-facet constraints;
+- bounded overlay adaptation to the domain's pure validator;
+- dependency/invalidation rules;
+- facet migration policy.
 
-### Schema compiler
+The Runtime adapter contributes these declarations to one exact framework registration
+bundle. It contains no domain algorithm or backend selection.
 
-Facet schemas are checked-in machine-readable inputs. `DesignDatabaseSchemaCompiler` validates them and generates:
+## 8. Validation
 
-- stable facet, table, column, relation, and index IDs;
-- typed Swift accessors and mutation bindings;
-- storage and record-batch descriptors;
-- canonical serializer / comparator metadata;
-- service schema descriptors and cross-language fixtures;
-- schema-diff reports used to admit or reject migrations.
-
-Generated code contains mechanical access and encoding only. Domain validation and algorithms remain handwritten
-in the owning adapter. Generated output is reproducible, checked in or retained as a build artifact, and verified
-against its source schema digest. Editing generated storage declarations without changing the source schema is a
-build failure.
-
-## 6. Read Snapshot
-
-`DesignReadSnapshot` is immutable and `Sendable`.
-
-- opening a snapshot may perform I/O and is asynchronous;
-- reading an already opened snapshot is synchronous;
-- a snapshot pins revision and index roots;
-- multiple tasks may read one snapshot concurrently;
-- snapshot reads never observe a partially committed transaction;
-- closing a database does not invalidate an outstanding snapshot lease until the lease is released;
-- a query result is always associated with the exact source revision.
-
-Small control-plane results may be copied. High-volume results use a closure-scoped borrowed view or an owned
-record batch. Unsafe pointers are not exposed by public API.
-
-## 7. Transaction
-
-`withTransaction(from:options:_:)` is asynchronous at its outer boundary and invokes a synchronous task-owned
-mutation closure.
-
-```mermaid
-stateDiagram-v2
-  [*] --> Open
-  Open --> Aborted: body throws / cancel
-  Open --> Validating: body returns
-  Validating --> Rejected: schema / reference / conflict failure
-  Validating --> Persisting: valid change set
-  Persisting --> Committed: manifest atomically published
-  Persisting --> Recovered: interrupted before publication
-  Committed --> [*]
-  Aborted --> [*]
-  Rejected --> [*]
-  Recovered --> [*]
-```
-
-Transaction invariants:
-
-- one explicit immutable base revision;
-- one owner task; transaction values are not `Sendable`;
-- read-your-writes semantics;
-- no nested transaction;
-- no `await`, external callback, or I/O inside a mutation closure;
-- every relation target is validated before commit;
-- entity creation, update, relation change, and deletion are recorded in one deterministic change set;
-- cancellation or thrown errors publish no revision;
-- a committed transaction produces a candidate revision but does not grant approval;
-- named-reference promotion is a separate atomic compare-and-set operation.
-
-Two transactions may commit independent candidate revisions from the same base. The current backend does not
-merge candidates. The planned merge contract will accept only mechanically disjoint field / relation changes;
-semantic conflicts remain the responsibility of the owning domain adapter or flow policy.
-
-## 8. Target Storage Architecture
-
-The current `DesignDatabaseNative` implementation is deliberately a safe value-semantic reference backend. It
-stores revision-scoped dictionaries and builds immutable name, hierarchy, connectivity, spatial, cross-facet,
-change, and dependency indexes when a snapshot is opened. Snapshots are cached by exact revision. It does not yet
-claim paged-column, memory-mapped, zero-copy, or OpenDB-comparable performance.
-
-The production storage target is a paged column store, not a tree of per-object Swift classes. This layout is not
-implemented by the current dictionary-backed reference backend.
-
-```text
-Revision Root
-├── Entity Directory
-│   └── entityID -> facet / table / slot / generation / lifecycle
-├── Facet Table Roots
-│   ├── scalar columns
-│   ├── interned string columns
-│   ├── variable-length arena references
-│   └── relation columns
-├── Index Roots
-└── Extension Roots
-```
-
-### Column and page rules
-
-- fixed-width fields use contiguous typed columns;
-- names and repeated strings use a revision-aware intern table;
-- variable payloads use immutable segment ranges, not one allocation per entity;
-- mutations copy only touched pages or variable segments;
-- page size is chosen from benchmark evidence and is not part of the public API;
-- page headers contain schema ID, column ID, element count, bounds, and checksum;
-- offsets, counts, alignment, and integer overflow are validated before access;
-- page bodies never store process pointers;
-- memory owner and exactly-once deallocation are internal and testable.
-
-The safe reference implementation uses ordinary Swift values. Any unsafe optimized implementation must be
-differentially equivalent, have scoped borrows, and pass sanitizer / lifetime / overflow tests.
-
-## 9. Required Indexes
-
-| Index | Required behavior |
+| Validation class | Owner |
 |---|---|
-| Entity | constant-time entity ID resolution |
-| Facet | entity enumeration by registered facet and kind |
-| Name | exact name and optional normalized-name lookup |
-| Hierarchy | parent / child and occurrence traversal |
-| Connectivity | net / pin adjacency, driver / load, connected component |
-| Spatial | region query by cell / layer / geometry class |
-| Cross-facet | logical / physical / parasitic / timing identity mapping |
-| Change | entity / field / relation changes between revisions |
-| Dependency | derived facet validity and invalidation source tracking |
+| Persisted field, required/default/reference, relationship, uniqueness, index, and physical migration invariants | `database-framework` |
+| Database/revision/schema/dependency/plan binding and candidate publication | `DesignDatabaseRuntime` |
+| Circuit-domain meaning independent of persistence | Domain package pure validator |
+| Database representation and cross-facet proposed-overlay adaptation | Domain schema target |
+| DRC/LVS/STA/PEX/formal/signoff | Owning Engine outside commit |
 
-Each query declares ordering. Unordered query results must not be persisted or hashed. Pagination cursors include
-revision and query-plan identity so they cannot be resumed against a different state.
+Validators are deterministic and side-effect-free. They may use only the supplied exact
+base/proposed view and explicit budgets. External tools, clock, randomness, event
+emission, and hidden global state are not commit validators.
 
-The query planner returns structured explain evidence containing selected indexes, estimated scan scope, ordering,
-temporary allocation budget, and whether a full scan was admitted. Agent and developer clients can inspect this
-without parsing logs.
+## 9. Snapshot
 
-Spatial and connectivity indexes are first-class revision data. Tools are not required to rebuild private copies
-for ordinary region or adjacency traversal. Specialized temporary algorithm indexes remain engine-owned.
+`DesignReadSnapshot` is an immutable, reference-semantic, `Sendable` lease owner.
+`DesignReadSnapshotReading` is its non-owning read contract, and
+`DesignReadSnapshotView` is the concrete value lent across compiler/validator
+boundaries that must not receive close authority:
 
-## 10. Persistence
+- open is asynchronous;
+- entity/query/change access may perform bounded asynchronous I/O;
+- all reads are bound to one exact revision;
+- independent reads are not serialized through one DesignDatabase actor;
+- multiple snapshots may share immutable decoded pages;
+- close is explicit, idempotent, and its cleanup result is observable;
+- a retained read view never extends the lease and fails typed after its owner closes;
+- a database handle cannot shut down while child snapshots or operations remain active;
+- high-volume results are bounded owned pages or closure-scoped borrowed views.
 
-The current file backend persists a canonical full database image through `pending.wal` and
-`database.manifest`. It holds both an in-process synchronized ownership registry and a process file lock, fsyncs
-WAL/manifest/directory publication boundaries, validates the WAL payload digest, and revalidates revision DAG,
-schema digests, state digests, change sets, entity schemas, references, and allocator state when opening. The
-immutable-segment layout below is the next backend, not the current on-disk format.
+The current synchronous Native snapshot is a reference oracle, not the production API.
 
-```text
-<database-root>/
-├── database.manifest
-├── refs/
-│   └── <name>.ref
-├── revisions/
-│   └── <revision-id>.manifest
-├── segments/
-│   └── <content-digest>.segment
-├── wal/
-│   └── <transaction-id>.wal
-└── locks/
-```
+## 10. Plan-First Commit
 
-- segments and revision manifests are immutable;
-- WAL records are checksummed and length-bounded;
-- a revision is visible only after every referenced segment is durable and its manifest is atomically published;
-- recovery either completes a valid publication or removes an unpublished transaction record;
-- corruption is a typed failure and never yields a partial successful snapshot;
-- compaction rewrites physical storage but preserves database, revision, entity identity and state digest;
-- `.xcircuite` stores a database locator and revision references, not page or WAL files.
+The target public commit accepts one immutable `DesignMutationPlan`.
 
-SQLite may be used by an optional metadata catalog implementation. It is not the canonical entity / relation /
-spatial hot-path store.
+The plan binds:
 
-## 11. Concurrency
+- one database ID;
+- one exact base revision;
+- one exact schema root;
+- one exact direct dependency root;
+- one local operation ID and request digest, qualified at admission by the exact database
+  and stable authenticated authorization subject scope;
+- bounded semantic operations/chunks;
+- explicit provenance and resource budgets.
+
+Preparation:
+
+1. verifies the complete binding;
+2. reads the exact base and proposed overlay under bounds;
+3. assigns permanent entity/occurrence identities without reuse;
+4. runs generic and domain validation at their owning layers;
+5. creates immutable facet/projection/change pages;
+6. stores fixed pages under a staging root;
+7. computes the candidate manifest and canonical digests.
+
+One final framework transaction publishes the complete revision manifest and operation
+receipt or publishes no candidate. Framework retry never calls the plan builder,
+validator, external tool, or event sink.
+
+Commit and named-reference promotion are separate. An Agent can create a candidate but
+cannot approve it by using the commit API.
+
+The current `withTransaction` closure API remains Native-reference behavior until the
+target API replaces it.
+
+## 11. Semantic Projections
+
+DesignDatabase owns nine revision-bound projection families:
+
+| Projection | Contract |
+|---|---|
+| Entity | Exact stable-ID lookup |
+| Facet | Enumeration by exact facet and entity kind |
+| Name | Exact/interned name and hierarchy-path lookup |
+| Hierarchy | Parent/child occurrence traversal |
+| Connectivity | One-hop occurrence-preserving adjacency and driver/load lookup |
+| Spatial | Conservative container/layer/bounds candidates |
+| Cross-facet | Explicit logical/physical/parasitic/timing identity mapping |
+| Direct change | Typed key/before/after delta from target manifest state base |
+| Dependency | Derived-state source and invalidation lookup |
+
+Each revision stores boundary-independent semantic projection descriptors: family,
+semantic version, ordered entry count/key bounds, and a canonical sequence digest that
+does not depend on page size, fanout, physical codec, compression, or packing.
+
+Runtime separately binds each descriptor to one immutable physical materialization
+generation/root made of bounded content-addressed application node models stored through
+`database-framework`. A verified repack may CAS-publish a new physical generation for the
+same semantic digest without changing the revision or state digest. A snapshot pins one
+generation. These nodes are not new framework index types.
+
+Every canonical hierarchy, connectivity, cross-facet, and dependency edge has a stable
+relation-occurrence identity. Ordered or repeated edges are not represented by a set.
+
+Spatial entries have explicit `unlayered` or `layer` scope and stable nonzero IDs.
+Database pages return conservative bounds candidates; exact geometry is domain-owned.
+
+## 12. Query and Paging
+
+Circuit-scale paging is keyset-based over one exact semantic descriptor and one pinned
+physical materialization. A continuation
+binds:
+
+- database/revision/schema/projection semantic identity;
+- materialization generation, physical codec/profile, and root;
+- normalized semantic query;
+- canonical order;
+- last consumed key;
+- page and whole-query budgets;
+- DesignDatabase-observable node-fetch, encoded-read-byte, decoded-retained-byte,
+  output-byte, candidate, work, and result accounting;
+- completion reason.
+
+It does not use offset-only resume or fingerprint all preceding results. Current generic
+framework cursors and materialized index results are excluded from the authoritative
+circuit-scale path by contract and remain limited to explicitly bounded control-plane
+uses. Performance measurement cannot convert their offset/all-row semantics into a
+semantic keyset continuation.
+
+Unsupported or unindexed high-volume queries fail typed. They do not silently run a
+full scan.
+
+Physical projection trees are immutable copy-on-write balanced B+trees. All leaves share
+one depth; canonical key ranges are ordered, non-overlapping, and covering; non-root
+nodes satisfy declared minimum/maximum occupancy; split/merge restores occupancy before
+publication; and updates path-copy only affected root-to-leaf paths. Publication verifies
+height, occupancy, range coverage, node byte limits, entry count, and semantic digest.
+The checked profile therefore bounds lookup by `O(log N)` node fetches and paging by
+`O(log N + visited page nodes)`.
+
+## 13. Persistence and Recovery
+
+Production state is persisted only through framework public model and transaction APIs.
+DesignDatabase has no raw `storage-kit` bootstrap, key codec, page allocator, or WAL.
+
+- creation atomically inserts catalog, genesis revision, empty roots, creation receipt,
+  and `main`;
+- open lets framework perform physical migration, then validates the exact
+  DesignDatabase catalog, registration, schema, feature capability, and roots;
+- each staging transaction atomically inserts bounded immutable nodes and advances an
+  authenticated build-intent progress root;
+- candidate semantic descriptors and initial physical bindings remain invisible until
+  one manifest transaction publishes them with the receipt and terminalizes the intent;
+- subject-scoped operation receipts make idempotent results and typed failures
+  recoverable without cross-subject ID collision or disclosure;
+- unknown outcomes are reconciled from persisted operation state;
+- named references use exact revision plus generation CAS;
+- retention activation and exact revision+generation CAS release are operation-identified,
+  idempotent, and unknown-reconcilable; released claim IDs remain tombstoned and cannot
+  be reused;
+- semantic/physical GC uses a persisted reachability generation, epoch-bound root set,
+  per-delete generation recheck, and candidate-set-scoped Runtime
+  semantic-revision/materialization deletion admissions. Before its first node delete,
+  an atomic framework transaction persists the collection intent and changes the
+  revision or retired-generation lifecycle to deleting; a changed
+  publication/reference/retention/intent/binding restarts mark, while a targeted lease
+  race invalidates only its bounded batch and unrelated lease churn does not stop GC;
+- `storage-kit` owns physical durability and compaction.
+
+Opening a snapshot does not write a persistent pin. Local/direct profiles permit one
+maintenance authority; shared profiles use one qualified service authority. Retired
+semantic revisions and physical generations remain protected by pending/active Runtime
+snapshot leases. GC deletion admission rejects new leases for an exact candidate until
+its persisted collection intent reaches a terminal collected tombstone or aborts before
+any node deletion. Runtime reconstructs every nonterminal admission before accepting
+opens after restart, so no snapshot can observe a partially deleted tree. Exact semantic
+revision identity remains unchanged and is never reused.
+
+The current full-image WAL remains a reference backend only.
+
+## 14. Concurrency
 
 | State | Isolation |
 |---|---|
-| open / close, commit ordering, ref update, recovery | coordinator actor |
-| immutable read snapshot | lock-free immutable owner |
-| task-local transaction builder | single owner, non-`Sendable` |
-| short page-cache bookkeeping | `Mutex<State>` |
-| persistence I/O | actor ordered; outside `Mutex` critical section |
-| service session lifecycle | actor |
+| Framework container and persisted transactions | Framework lifecycle and transaction contract |
+| DesignDatabase handle/session | Explicit owner with child operation/snapshot leases |
+| Snapshot | Immutable concurrent owner |
+| Finished mutation plan | Immutable `Sendable` value/owner |
+| Preparation | Task-owned bounded workers over exact immutable inputs |
+| Decoded-page cache | Sharded `Mutex<State>`; I/O/decode outside lock |
+| Snapshot/GC lease coordinator | One maintenance-authority actor; ordered pending/active/deletion-admission transitions, with framework I/O outside isolation |
+| Workspace mount/session | `Xcircuite` actor because I/O and ordered lifecycle are involved |
 
-Native, WASM, and Embedded share the same logical isolation contract. `hasFeature(Embedded)` must not replace a
-`Mutex<State>` with raw mutable state or weaken `Sendable` / owner / lease contracts.
+Native, WASM, and Embedded must retain the same shared-state isolation contract. Target
+capability differences are explicit; `hasFeature(Embedded)` never removes synchronization.
 
-## 12. External Service
+Serialization is an explicit package capability rather than a portable Core invariant.
+The default `FoundationSerialization` trait enables `Codable` contracts and the
+`CircuiteFoundationFoundation` bridge required by host persistence, Runtime payloads,
+and service wire messages. Building `DesignDatabaseCore` with
+`--disable-default-traits` removes that dependency and the codec declarations while
+preserving the same value validation, ordering, ownership, and isolation behavior.
+Portable consumers must not infer serialization support from the presence of a Core
+value; host boundaries select the trait deliberately. Unsupported product/profile
+combinations fail at build or through a typed capability result and never fall back to
+another backend.
 
-The native API and service API share identity, revision, schema, capability, error, and query semantics.
+## 15. Workspace and Release Boundary
 
-```mermaid
-flowchart LR
-  Client["Swift / Python / Tcl / Agent Client"] --> Negotiate["Protocol + Schema + Capability Negotiation"]
-  Negotiate --> Session["Database Session"]
-  Session --> Snapshot["Read Snapshot Lease"]
-  Session --> Transaction["Remote Transaction"]
-  Snapshot --> Stream["Record Batch / Change Stream"]
-  Transaction --> Candidate["Candidate Revision"]
-```
+DesignDatabase opens and mutates one database. Xcircuite composes multiple mounts and
+exact snapshots.
 
-Control-plane messages carry Foundation values. Large data uses versioned binary record batches with explicit
-endianness, field widths, offsets, null representation, bounds, and checksums. Local clients may use memory-mapped
-immutable segments; remote clients use bounded streaming with backpressure.
+There is no cross-database transaction. Multi-database ECO and SoC/chiplet release use:
 
-Every remote operation has a deadline and cancellation path. Snapshot and transaction leases expire explicitly.
-Change streams expose revision cursors and provide `shutdown()` that finishes their continuation.
+- independently verified candidates;
+- explicit dependency updates in parent candidates;
+- one immutable resolved dependency graph;
+- one ReleaseEngine-owned multi-database bundle.
 
-## 13. OpenDB Compatibility
+Within one database, deterministic disjoint-branch assessment remains read-only. A
+separate validated merge-publication operation binds one exact one-parent validation
+commit, re-assesses the same base and parents, authenticates that commit's persisted
+claim/outcome inside the bounded publication transaction, and may publish a distinct
+two-parent candidate revision. This operation does not update `main` or confer approval,
+qualification, or release authority.
 
-OpenDB compatibility is optional and isolated.
+`.xcircuite` stores mount configuration, exact references, run/actions, approval, and
+artifact availability. It does not store DesignDatabase pages, indexes, WAL, or recovery
+state.
 
-| Compatibility level | Design |
-|---|---|
-| Artifact | import / export LEF, DEF, and OpenDB-produced artifacts |
-| Identity | map scoped OpenDB object type + OID + source DB digest to `ExternalObjectReference` |
-| Object semantics | map `dbTech`, `dbLib`, `dbChip`, and `dbBlock` to registered facets |
-| API | provide an OpenDB-style external client facade over exact DesignDatabase revisions |
-| Behavior | run corpus differential tests and return structured loss reports |
-| FFI | optional later optimization for qualified operations only |
+## 16. External Compatibility
 
-OpenDB is based on LEF / DEF, exposes multiple database instances, and preserves 32-bit OIDs across save / restore.
-Those properties are compatibility inputs, not Native storage constraints. OpenDB does not provide a general
-region query and tools may build their own structures; DesignDatabase keeps spatial and connectivity indexes in
-the canonical revision.
+DesignDatabase provides protocol-neutral exact revision, query, plan, and extension
+contracts. EDAInteroperability owns:
 
-An OpenDB adapter never mutates a canonical revision directly. It creates a transaction patch, records source
-identity and loss information, validates it, and produces a candidate revision.
+- OpenDB OID and object mapping;
+- `.odb`, LEF, and DEF conversion;
+- OpenROAD process/artifact adapters;
+- XLS mapping;
+- compatibility-only metadata schema;
+- loss reports and differential evidence.
 
-OpenROAD algorithm adapters live in the owning Engine. Backend selection is explicit: `native`, `openROAD`, or
-`correlation`. A native failure never silently falls back to OpenROAD.
+Canonical domain objects are written through their domain schema adapters. Optional
+compatibility metadata uses an explicit compatibility schema and a mechanical
+registration adapter composed by Xcircuite.
 
-OpenDB compatibility inputs are based on the official OpenDB object / OID / save-restore contracts. OpenDB's
-schema generator is an interoperability reference, not a source dependency. DesignDatabase uses its own facet
-schema compiler so photonic, 3D, multi-physics, revision, service, and integrated-index contracts are not constrained
-by LEF / DEF object layout.
+External tools never mutate a canonical revision directly. Native failure does not
+silently select an external backend.
 
-## 14. Standard Formats
+## 17. Standard Formats
 
 | Boundary | Authority |
 |---|---|
-| active edit and analysis | immutable DesignDatabase revision |
-| import / export | owning standard parser / serializer package |
-| independent verification | digest-verified standard artifact and raw tool evidence |
-| tapeout / release | standard artifacts accepted by release policy |
-| run history | `.xcircuite` ledger referencing exact revisions and artifacts |
+| Active working state | Exact DesignDatabase revision |
+| Cross-database dependency | Exact revision/content dependency lock |
+| Import/export | Owning standard parser/serializer |
+| Independent verification | Digest-verified standard artifact and raw evidence |
+| Release/tapeout | Release bundle plus standard artifacts and signoff evidence |
+| Human/Agent history | `.xcircuite` ledger with exact references |
 
-Importers create transactions. Exporters read an exact snapshot. Every export records source revision, schema set,
-producer, configuration, artifact digest, and byte count. Round-trip loss is explicit.
+Every import produces a base-bound candidate plan. Every export reads one exact snapshot
+and records revision, schema, dependency graph, producer, configuration, digest, and
+byte count.
 
-## 15. Performance Contract
+## 18. Performance Contract
 
-Performance claims require a named workload and measurement. Required benchmark dimensions include:
+Measure before optimizing. Retained evidence must name:
 
-- entity lookup latency;
-- hierarchy traversal throughput;
-- connectivity traversal throughput;
-- layer / region spatial query latency;
-- transaction mutation and commit throughput;
-- snapshot open latency;
-- revision diff latency;
-- persistence save / restore throughput;
-- resident memory per entity / relation / shape;
-- allocations and copied bytes per operation;
-- service record-batch throughput and backpressure behavior;
-- corresponding OpenDB workload where semantic parity exists.
+- workload and dataset digest;
+- entity/relation/shape counts;
+- backend profile and schema/projection versions;
+- hardware, build, and cache state;
+- p50/p95/p99 latency and throughput;
+- peak memory, allocations, copied bytes, and storage amplification;
+- exact correctness digest against the Native oracle.
 
-No fixed page size, tree type, unsafe representation, or compression algorithm is accepted without benchmark and
-differential correctness evidence.
+Full-process allocations and copied bytes are benchmark evidence. Continuations report
+only DesignDatabase-observable node fetches and encoded/decoded/output byte counters;
+they do not claim visibility into backend-internal copies.
 
-## 16. Failure Contract
+Required paths include entity, hierarchy, connectivity, spatial candidate/refinement,
+dependency update, plan preparation/commit, snapshot open/cache, direct change, and
+service paging.
 
-Errors are typed by boundary: identity, schema, capability, snapshot, query, transaction, conflict, validation,
-persistence, corruption, resource, service, and external compatibility.
+Unsafe or zero-copy work requires explicit owner/borrow lifetime, differential tests,
+sanitizers, and measured improvement. A slow backend profile may be rejected or replaced
+through Xcircuite composition; it does not justify patching the fixed framework.
 
-- unavailable entities do not become empty records;
-- unknown facets do not become generic property bags;
-- corrupted pages do not become zeroed pages;
-- unsupported queries do not become full scans unless the caller explicitly permits a scan plan;
-- failed native operations do not silently invoke an external backend;
-- interrupted commits do not publish revisions;
-- compatibility loss never reports lossless success.
+## 19. Failure Contract
 
-## 17. Integration Sequence
+Errors are typed by identity, open, schema, capability, dependency, snapshot, query,
+plan, validation, conflict, persistence, corruption, resource, authorization, service,
+and compatibility boundary.
+
+- missing state is not an empty record;
+- missing dependency is not another revision;
+- unsupported query is not an implicit full scan;
+- commit disconnect is not guessed success/failure;
+- failed native execution is not external fallback;
+- compatibility loss is not lossless success;
+- cross-database mutation is rejected before admission;
+- release incompleteness is not an approved bundle.
+
+## 20. Integration Sequence
 
 ```mermaid
 sequenceDiagram
   participant X as Xcircuite
-  participant DB as DesignDatabase
-  participant A as Domain Adapter
+  participant D as DesignDatabase
+  participant A as Domain Schema Adapter
   participant E as Domain Engine
-  participant K as DesignFlowKernel
+  participant F as DesignFlowKernel
 
-  X->>DB: open exact base revision
-  DB-->>X: immutable snapshot
-  X->>A: create typed facet view
-  A->>E: execute with exact snapshot input
-  E-->>X: typed result / patch / evidence
-  X->>DB: apply patch in transaction
-  DB-->>X: candidate revision
-  X->>K: register candidate and evidence
-  K-->>X: approval / rejection
-  X->>DB: compare-and-set named reference
+  X->>D: Open exact write-target base
+  X->>X: Resolve exact dependency snapshots
+  D-->>X: Immutable snapshot
+  X->>A: Build typed domain view
+  A->>E: Base + exact dependency inputs
+  E-->>X: Typed patch + evidence
+  X->>A: Build one-database immutable plan
+  X->>D: Commit plan
+  D-->>X: Candidate revision + receipt
+  X->>F: Candidate + diff + resolved graph + evidence
+  F-->>X: Approval or rejection
+  X->>D: Authorized reference CAS
 ```
 
-Database atomicity, flow approval, and engine correctness remain separate decisions.
-
-## 18. References
-
-- [OpenDB official documentation](https://openroad.readthedocs.io/en/latest/main/src/odb/README.html)
-- [OpenDB code generator documentation](https://openroad.readthedocs.io/en/latest/main/src/odb/src/codeGenerator/README.html)
-- [OpenROAD developer guide](https://openroad.readthedocs.io/en/latest/contrib/DeveloperGuide.html)
+Until this framework-backed path and at least one real domain vertical slice pass their
+success, failure, recovery, and performance gates, DesignDatabase is not production
+ready.

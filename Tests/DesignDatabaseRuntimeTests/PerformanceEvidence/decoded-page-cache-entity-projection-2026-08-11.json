@@ -1,0 +1,78 @@
+{
+  "schemaVersion": 1,
+  "evidenceID": "decoded-page-cache-entity-projection-2026-08-11",
+  "capturedAt": "2026-08-11T15:12:22+09:00",
+  "qualification": "behaviorallyVerified",
+  "source": {
+    "baseCommit": "747275e3d40f3dffa050e703c7207ae18b237a63",
+    "workingTreeModified": true,
+    "fileDigests": [
+      {
+        "relativePath": "Sources/DesignDatabaseRuntime/DesignProjectionDecodedPageCache.swift",
+        "sha256": "4ce7398570acba2541646808b1d7bb1d0d6b52ae6b10aa64e2a88c3e32061e42"
+      },
+      {
+        "relativePath": "Sources/DesignDatabaseRuntime/DesignProjectionTreeReader.swift",
+        "sha256": "3875a05fe088f039c8011a541f35e835836eb5ac6a57f129574956b329a87930"
+      }
+    ],
+    "databaseFrameworkVersion": "26.809.1",
+    "databaseFrameworkRevision": "be27247ebe88a7e0e11fd992e97344488bca5de2"
+  },
+  "environment": {
+    "operatingSystem": "macOS 27.0 (26A5388g)",
+    "processor": "Apple M4 Max",
+    "memoryBytes": 38654705664,
+    "swiftVersion": "6.4-dev",
+    "swiftCompilerRevision": "ef761e567dc94ee",
+    "target": "arm64-apple-macosx27.0.0",
+    "buildConfiguration": "debug assertions"
+  },
+  "workload": {
+    "test": "DesignDatabaseRuntimeRegistrationTests/entityProjectionPublicationLifecycle()",
+    "backend": "managed-local SQLite",
+    "projectionFamily": "entity",
+    "resultRowCount": 1,
+    "encodedPageByteCount": 121,
+    "capturedTestElapsedSeconds": 0.388
+  },
+  "correctness": {
+    "coldWarmRowsEqual": true,
+    "coldWarmReportsEqual": true,
+    "canonicalSequenceDigest": "77310cd576ecc9927011c06f6b0e2b2e1d6c5127534e2347aea957473e79df10"
+  },
+  "cold": {
+    "lookupCount": 1,
+    "hitCount": 0,
+    "missCount": 1,
+    "databaseReadCount": 1,
+    "decodeAttemptCount": 1,
+    "payloadMaterializationByteCount": 121,
+    "avoidedDatabaseReadCount": 0,
+    "avoidedDecodeCount": 0,
+    "avoidedPayloadMaterializationByteCount": 0,
+    "residentEntryCount": 1,
+    "accountedResidentByteCount": 110,
+    "activeLeaseCount": 0
+  },
+  "warm": {
+    "lookupCount": 2,
+    "hitCount": 1,
+    "missCount": 1,
+    "databaseReadCount": 1,
+    "decodeAttemptCount": 1,
+    "payloadMaterializationByteCount": 121,
+    "avoidedDatabaseReadCount": 1,
+    "avoidedDecodeCount": 1,
+    "avoidedPayloadMaterializationByteCount": 121,
+    "residentEntryCount": 1,
+    "accountedResidentByteCount": 110,
+    "activeLeaseCount": 0
+  },
+  "limitations": [
+    "This evidence measures one deterministic entity-projection page in a debug build.",
+    "Payload materialization bytes are an instrumented copy-path proxy, not a full-process malloc allocation count.",
+    "The source working tree was modified, so the exact source-file digests are authoritative instead of the base commit alone.",
+    "No independent Native oracle or circuit-scale latency distribution is included."
+  ]
+}

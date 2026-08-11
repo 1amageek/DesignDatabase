@@ -1,6 +1,6 @@
 import CircuiteFoundation
 
-public struct DesignEntityRecord: Sendable, Hashable, Codable {
+public struct DesignEntityRecord: Sendable, Hashable, DesignDatabaseSerializable {
   public let key: DesignEntityKey
   public let facetID: DesignFacetID
   public let kindID: DesignEntityKindID

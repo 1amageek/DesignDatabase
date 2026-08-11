@@ -1,4 +1,6 @@
 import CircuiteFoundation
+import CircuiteFoundationCrypto
+import CircuiteFoundationFoundation
 import Darwin
 import DesignDatabaseCore
 import Foundation
@@ -189,7 +191,7 @@ public actor FileDesignDatabasePersistence: DesignDatabasePersisting {
   }
 
   private static func releaseInProcessLock(path: String) {
-    lockedPaths.withLock { paths in
+    _ = lockedPaths.withLock { paths in
       paths.remove(path)
     }
   }

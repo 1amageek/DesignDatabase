@@ -1,6 +1,6 @@
 import CircuiteFoundation
 
-public struct DesignEntitySchema: Sendable, Hashable, Codable {
+public struct DesignEntitySchema: Sendable, Hashable, DesignDatabaseSerializable {
   public let kindID: DesignEntityKindID
   public let fields: [DesignFieldSchema]
   public let relations: [DesignRelationSchema]
@@ -54,6 +54,7 @@ public struct DesignEntitySchema: Sendable, Hashable, Codable {
     self.uniqueConstraints = uniqueConstraints.sorted { $0.id < $1.id }
   }
 
+#if DESIGN_DATABASE_FOUNDATION_SERIALIZATION
   public init(from decoder: any Decoder) throws {
     let container = try decoder.container(keyedBy: CodingKeys.self)
     try self.init(
@@ -63,11 +64,14 @@ public struct DesignEntitySchema: Sendable, Hashable, Codable {
       uniqueConstraints: container.decode([DesignUniqueConstraint].self, forKey: .uniqueConstraints)
     )
   }
+#endif
 
+#if DESIGN_DATABASE_FOUNDATION_SERIALIZATION
   private enum CodingKeys: String, CodingKey {
     case kindID
     case fields
     case relations
     case uniqueConstraints
   }
+#endif
 }

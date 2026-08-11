@@ -1,4 +1,4 @@
-public struct DesignQuery: Sendable, Hashable, Codable {
+public struct DesignQuery: Sendable, Hashable, DesignDatabaseSerializable {
   public let source: DesignQuerySource
   public let predicate: DesignPredicate?
   public let ordering: DesignOrdering

@@ -1,4 +1,6 @@
 import CircuiteFoundation
+import CircuiteFoundationCrypto
+import CircuiteFoundationFoundation
 import DesignDatabaseCore
 import DesignDatabaseNative
 import DesignDatabasePersistence
@@ -44,9 +46,9 @@ struct FileDesignDatabasePersistenceTests {
 
     let schema = try makeSchema()
     let firstPersistence = try FileDesignDatabasePersistence(rootURL: rootURL)
-    let firstProvider = NativeDesignDatabaseProvider(persistence: firstPersistence)
+    let firstProvider = try makeProvider(persistence: firstPersistence)
     let first = try await firstProvider.create(
-      DesignDatabaseCreateRequest(
+      DesignReferenceDatabaseCreateRequest(
         schemas: [schema.value],
         capabilities: try DesignCapabilitySet([])
       )
@@ -72,7 +74,7 @@ struct FileDesignDatabasePersistenceTests {
     try await first.close()
 
     let secondPersistence = try FileDesignDatabasePersistence(rootURL: rootURL)
-    let second = try await NativeDesignDatabaseProvider(persistence: secondPersistence).open()
+    let second = try await makeProvider(persistence: secondPersistence).open()
     let reopened = try await second.resolve(.named(.main))
     #expect(reopened == transaction.candidateRevision)
     let snapshot = try await second.snapshot(at: reopened)
@@ -81,6 +83,85 @@ struct FileDesignDatabasePersistenceTests {
     )
     #expect(record.fields[schema.field] == .string("persisted"))
     try await second.close()
+  }
+
+  @Test
+  func retentionOutcomesPersistWithoutCrossSubjectCollisionOrDisclosure() async throws {
+    let rootURL = FileManager.default.temporaryDirectory
+      .appendingPathComponent(
+        "design-database-retention-\(UUID().uuidString)",
+        isDirectory: true
+      )
+    defer { removeTestDirectory(rootURL) }
+
+    let firstPersistence = try FileDesignDatabasePersistence(rootURL: rootURL)
+    let first = try await makeProvider(
+      persistence: firstPersistence,
+      scopeLow: 1
+    ).create(
+      DesignReferenceDatabaseCreateRequest(
+        schemas: [],
+        capabilities: DesignCapabilitySet([])
+      )
+    )
+    let root = try await first.resolve(.named(.main))
+    let firstRequest = try makeRetentionRequest(
+      operation: "shared-local-operation",
+      claim: "first-subject-claim",
+      revision: root
+    )
+    let firstReceipt = try appliedReceipt(try await first.retain(firstRequest))
+    let firstOperation = DesignDatabaseOperationReference(
+      databaseID: first.databaseID,
+      authorizationSubjectScopeID: first.authorizationSubjectScopeID,
+      operationID: firstRequest.operationID
+    )
+    try await first.close()
+
+    let secondPersistence = try FileDesignDatabasePersistence(rootURL: rootURL)
+    let secondGrants = DesignDatabaseAuthorizationGrantSet([
+      .read,
+      .retain,
+      .inspectOwnOperationOutcome,
+    ])
+    let second = try await makeProvider(
+      persistence: secondPersistence,
+      scopeLow: 2,
+      grants: secondGrants
+    ).open()
+    await #expect(throws: DesignDatabaseError.self) {
+      _ = try await second.retentionStatus(
+        operation: firstOperation,
+        requestDigest: firstRequest.requestDigest
+      )
+    }
+
+    let secondRequest = try makeRetentionRequest(
+      operation: "shared-local-operation",
+      claim: "second-subject-claim",
+      revision: root
+    )
+    let secondReceipt = try appliedReceipt(try await second.retain(secondRequest))
+    #expect(secondReceipt.operation.operationID == firstReceipt.operation.operationID)
+    #expect(
+      secondReceipt.operation.authorizationSubjectScopeID
+        != firstReceipt.operation.authorizationSubjectScopeID
+    )
+    try await second.close()
+
+    let administratorPersistence = try FileDesignDatabasePersistence(rootURL: rootURL)
+    let administrator = try await makeProvider(
+      persistence: administratorPersistence,
+      scopeLow: 2,
+      grants: DesignDatabaseAuthorizationGrantSet([.read, .administer])
+    ).open()
+    #expect(
+      try await administrator.retentionStatus(
+        operation: firstOperation,
+        requestDigest: firstRequest.requestDigest
+      ) == .applied(firstReceipt)
+    )
+    try await administrator.close()
   }
 
   private func makeSchema() throws -> SchemaFixture {
@@ -112,6 +193,63 @@ struct FileDesignDatabasePersistenceTests {
         indexes: []
       )
     )
+  }
+
+  private func makeProvider(
+    persistence: any DesignDatabasePersisting,
+    scopeLow: UInt64 = 1,
+    grants: DesignDatabaseAuthorizationGrantSet = DesignDatabaseAuthorizationGrantSet(
+      DesignDatabaseAuthorizationGrant.allCases
+    )
+  ) throws -> NativeDesignDatabaseProvider {
+    let subjectScopeID = try DesignAuthorizationSubjectScopeID(
+      high: 0x444442,
+      low: scopeLow
+    )
+    return NativeDesignDatabaseProvider(
+      authorizationSubjectScopeID: subjectScopeID,
+      grantedAuthorization: grants,
+      persistence: persistence
+    )
+  }
+
+  private func makeRetentionRequest(
+    operation: String,
+    claim: String,
+    revision: DesignRevisionReference
+  ) throws -> DesignRevisionRetentionRequest {
+    let operationID = try DesignDatabaseOperationID(rawValue: operation)
+    let claimID = try DesignRevisionRetentionID(rawValue: claim)
+    let reason = try DesignRevisionRetentionReason(rawValue: "release-bundle")
+    let evidenceDigest = try ContentDigest(
+      algorithm: .sha256,
+      hexadecimalValue: String(repeating: "c", count: 64)
+    )
+    let requestDigest = try DesignRevisionRetentionDigest.retainingRequest(
+      operationID: operationID,
+      claimID: claimID,
+      revision: revision,
+      reason: reason,
+      evidenceDigest: evidenceDigest,
+      using: SHA256ContentDigester()
+    )
+    return DesignRevisionRetentionRequest(
+      operationID: operationID,
+      claimID: claimID,
+      revision: revision,
+      reason: reason,
+      evidenceDigest: evidenceDigest,
+      requestDigest: requestDigest
+    )
+  }
+
+  private func appliedReceipt(
+    _ submission: DesignRevisionRetentionSubmission
+  ) throws -> DesignRevisionRetentionReceipt {
+    guard case .applied(let receipt) = submission else {
+      throw DesignDatabaseError.corruption("Expected an applied retention receipt.")
+    }
+    return receipt
   }
 
   private func removeTestDirectory(_ url: URL) {

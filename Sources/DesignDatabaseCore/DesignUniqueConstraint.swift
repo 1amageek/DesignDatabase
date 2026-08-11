@@ -1,4 +1,4 @@
-public struct DesignUniqueConstraint: Sendable, Hashable, Codable {
+public struct DesignUniqueConstraint: Sendable, Hashable, DesignDatabaseSerializable {
   public let id: DesignUniqueConstraintID
   public let fields: [DesignFieldID]
 
@@ -16,6 +16,7 @@ public struct DesignUniqueConstraint: Sendable, Hashable, Codable {
     self.fields = fields
   }
 
+#if DESIGN_DATABASE_FOUNDATION_SERIALIZATION
   public init(from decoder: any Decoder) throws {
     let container = try decoder.container(keyedBy: CodingKeys.self)
     try self.init(
@@ -23,9 +24,12 @@ public struct DesignUniqueConstraint: Sendable, Hashable, Codable {
       fields: container.decode([DesignFieldID].self, forKey: .fields)
     )
   }
+#endif
 
+#if DESIGN_DATABASE_FOUNDATION_SERIALIZATION
   private enum CodingKeys: String, CodingKey {
     case id
     case fields
   }
+#endif
 }

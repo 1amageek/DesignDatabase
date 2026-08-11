@@ -1,4 +1,4 @@
-public struct DesignFieldSchema: Sendable, Hashable, Codable {
+public struct DesignFieldSchema: Sendable, Hashable, DesignDatabaseSerializable {
   public let id: DesignFieldID
   public let valueKind: DesignValueKind
   public let isRequired: Bool
