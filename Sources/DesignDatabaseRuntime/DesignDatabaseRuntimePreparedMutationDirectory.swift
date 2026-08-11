@@ -87,9 +87,10 @@ package struct DesignDatabaseRuntimePreparedMutationDirectory: Sendable {
           requested: byteCount
         )
       }
+      let encodedPayload = Array(data)
       self.records = records
-      self.encodedPayload = Array(data)
-      self.digest = try Self.digest(Array(data), using: digester)
+      self.encodedPayload = encodedPayload
+      self.digest = try Self.digest(encodedPayload, using: digester)
     } catch let error as DesignDatabaseRuntimeError {
       throw error
     } catch {

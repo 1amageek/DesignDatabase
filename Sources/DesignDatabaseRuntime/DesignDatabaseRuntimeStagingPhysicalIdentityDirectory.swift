@@ -236,9 +236,10 @@ package struct DesignDatabaseRuntimeStagingPhysicalIdentityDirectory: Sendable {
             requested: UInt64(exactly: data.count) ?? UInt64.max
           )
       }
+      let encodedPayload = Array(data)
       self.identities = ordered
-      encodedPayload = Array(data)
-      digest = try Self.digest(Array(data), using: digester)
+      self.encodedPayload = encodedPayload
+      digest = try Self.digest(encodedPayload, using: digester)
     } catch let error as DesignDatabaseRuntimeError {
       throw error
     } catch {
