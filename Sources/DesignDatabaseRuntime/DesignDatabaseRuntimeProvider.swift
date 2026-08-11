@@ -2,13 +2,24 @@ import CircuiteFoundation
 import DesignDatabaseCore
 
 public actor DesignDatabaseRuntimeProvider: DesignDatabaseProviding {
+  private enum Lifecycle {
+    case open
+    case closing
+    case closed
+  }
+
   private let registration: DesignDatabaseRuntimeRegistrationBundle
   private let containerProvider: any DesignDatabaseRuntimeContainerProviding
   private let authorizationSubjectScopeID: DesignAuthorizationSubjectScopeID
   private let creationRequestedAuthorization: DesignDatabaseAuthorizationGrantSet
   private let authorizer: any DesignDatabaseAuthorizing
   private var handles: [DesignDatabaseRuntimeHandle] = []
-  private var isClosed = false
+  private var lifecycle: Lifecycle = .open
+  private var activeOperationCount = 0
+  private var operationDrainWaiters: [CheckedContinuation<Void, Never>] = []
+  private var closeWaiters: [
+    CheckedContinuation<DesignDatabaseTermination, Never>
+  ] = []
 
   public init(
     registration: DesignDatabaseRuntimeRegistrationBundle,
@@ -27,7 +38,8 @@ public actor DesignDatabaseRuntimeProvider: DesignDatabaseProviding {
   public func create(
     _ request: DesignDatabaseCreateRequest
   ) async throws(DesignDatabaseError) -> any DesignDatabaseHandle {
-    try requireOpen()
+    try beginOperation()
+    defer { completeOperation() }
     let grants = try await authorizer.authorizeRequestedGrants(
       creationRequestedAuthorization,
       for: authorizationSubjectScopeID
@@ -87,7 +99,7 @@ public actor DesignDatabaseRuntimeProvider: DesignDatabaseProviding {
         expectedDatabaseID: request.databaseID,
         requiredFeatureCapabilities: request.declaredFeatureCapabilities
       )
-      guard !isClosed else {
+      guard lifecycle == .open else {
         _ = await attachment.close()
         throw DesignDatabaseError.closed
       }
@@ -120,7 +132,8 @@ public actor DesignDatabaseRuntimeProvider: DesignDatabaseProviding {
   public func open(
     _ request: DesignDatabaseOpenRequest
   ) async throws(DesignDatabaseError) -> any DesignDatabaseHandle {
-    try requireOpen()
+    try beginOperation()
+    defer { completeOperation() }
     let grants = try await authorizer.authorizeRequestedGrants(
       request.requestedAuthorization,
       for: authorizationSubjectScopeID
@@ -146,7 +159,7 @@ public actor DesignDatabaseRuntimeProvider: DesignDatabaseProviding {
         expectedDatabaseID: request.expectedDatabaseID,
         requiredFeatureCapabilities: request.requiredFeatureCapabilities
       )
-      guard !isClosed else {
+      guard lifecycle == .open else {
         _ = await attachment.close()
         throw DesignDatabaseError.closed
       }
@@ -177,12 +190,25 @@ public actor DesignDatabaseRuntimeProvider: DesignDatabaseProviding {
   }
 
   public func close() async -> DesignDatabaseTermination {
-    guard !isClosed else { return .alreadyClosed }
-    isClosed = true
+    switch lifecycle {
+    case .closed:
+      return .alreadyClosed
+    case .closing:
+      return await withCheckedContinuation { continuation in
+        closeWaiters.append(continuation)
+      }
+    case .open:
+      lifecycle = .closing
+    }
+    await waitForOperationsToDrain()
     for handle in handles {
       _ = await handle.close()
     }
     handles.removeAll(keepingCapacity: false)
+    lifecycle = .closed
+    let waiters = closeWaiters
+    closeWaiters.removeAll(keepingCapacity: false)
+    for waiter in waiters { waiter.resume(returning: .closed) }
     return .closed
   }
 
@@ -206,7 +232,28 @@ public actor DesignDatabaseRuntimeProvider: DesignDatabaseProviding {
   }
 
   private func requireOpen() throws(DesignDatabaseError) {
-    guard !isClosed else { throw .closed }
+    guard lifecycle == .open else { throw .closed }
+  }
+
+  private func beginOperation() throws(DesignDatabaseError) {
+    try requireOpen()
+    activeOperationCount += 1
+  }
+
+  private func completeOperation() {
+    precondition(activeOperationCount > 0)
+    activeOperationCount -= 1
+    guard activeOperationCount == 0 else { return }
+    let waiters = operationDrainWaiters
+    operationDrainWaiters.removeAll(keepingCapacity: false)
+    for waiter in waiters { waiter.resume() }
+  }
+
+  private func waitForOperationsToDrain() async {
+    guard activeOperationCount > 0 else { return }
+    await withCheckedContinuation { continuation in
+      operationDrainWaiters.append(continuation)
+    }
   }
 
   private static func map(

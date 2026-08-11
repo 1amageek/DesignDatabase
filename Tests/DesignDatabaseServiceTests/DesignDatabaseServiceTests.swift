@@ -4,6 +4,10 @@ import DesignDatabaseService
 import Foundation
 import Testing
 
+#if os(macOS)
+import Darwin
+#endif
+
 @Suite
 struct DesignDatabaseServiceTests {
   @Test
@@ -147,15 +151,45 @@ struct DesignDatabaseServiceTests {
     }
     try await stalledTransport.close()
 
+    let processFixture = FileManager.default.temporaryDirectory.appending(
+      path: "design-database-process-cleanup-\(UUID().uuidString)",
+      directoryHint: .isDirectory
+    )
+    try FileManager.default.createDirectory(
+      at: processFixture,
+      withIntermediateDirectories: true
+    )
+    defer {
+      do {
+        try FileManager.default.removeItem(at: processFixture)
+      } catch {
+        Issue.record("Failed to remove process cleanup fixture: \(error)")
+      }
+    }
+    let parentPIDURL = processFixture.appending(path: "parent.pid")
+    let childPIDURL = processFixture.appending(path: "child.pid")
     let uncooperativeTransport = try DesignDatabaseServiceProcessWireTransport(
-      executableURL: URL(fileURLWithPath: "/usr/bin/tail"),
-      arguments: ["-f", "/dev/null"],
+      executableURL: URL(fileURLWithPath: "/bin/sh"),
+      arguments: [
+        "-c",
+        "echo $$ > '\(parentPIDURL.path)'; (trap '' TERM; while :; do sleep 1; done) & echo $! > '\(childPIDURL.path)'; trap '' TERM; while :; do sleep 1; done",
+      ],
       maximumFrameByteCount: budget.maximumFrameByteCount,
       closeGracePeriod: .milliseconds(50)
     )
-    await #expect(throws: DesignDatabaseServiceWireTransportError.self) {
+    let parentPID = try await readProcessID(at: parentPIDURL)
+    let childPID = try await readProcessID(at: childPIDURL)
+    let firstClose = Task {
       try await uncooperativeTransport.close()
     }
+    await Task.yield()
+    let secondClose = Task {
+      try await uncooperativeTransport.close()
+    }
+    try await firstClose.value
+    try await secondClose.value
+    #expect(await processIsGone(parentPID))
+    #expect(await processIsGone(childPID))
   }
 
   @Test
@@ -396,6 +430,104 @@ struct DesignDatabaseServiceTests {
     let transportIsClosed = await transport.isClosed
     #expect(observedSuccessfulQueryPage)
     #expect(transportIsClosed)
+  }
+
+  @Test
+  func remoteShutdownRejectsLateSessionPublicationAndIsSingleFlight() async throws {
+    let fixture = try ServiceFixture()
+    let remoteConfiguration = try DesignDatabaseServiceRemoteConfiguration(
+      wireCodecBudget: DesignDatabaseServiceWireCodecBudget(
+        maximumFrameByteCount: 1_048_576,
+        maximumMetadataByteCount: 16_384,
+        maximumPayloadByteCount: 1_000_000
+      ),
+      queryPageCodecBudget: DesignDatabaseServiceQueryPageCodecBudget(
+        maximumFrameByteCount: 1_000_000,
+        maximumMetadataByteCount: 16_384,
+        maximumRowCount: 1_024
+      ),
+      requestTimeout: .seconds(5)
+    )
+
+    func makeService(
+      blocking operation: DesignDatabaseServiceWireOperation
+    ) throws -> (
+      remote: RemoteDesignDatabaseService,
+      transport: BlockingLoopbackDesignDatabaseServiceWireTransport
+    ) {
+      let handle = try ServiceTestHandle(fixture: fixture, blocksResolve: false)
+      let localService = InProcessDesignDatabaseService(
+        database: handle,
+        schemas: [fixture.schema],
+        configuration: try DesignDatabaseServiceConfiguration(
+          maximumSessionCount: 2
+        )
+      )
+      let dispatcher = DesignDatabaseServiceRemoteDispatcher(
+        service: localService,
+        subjectContext: DesignDatabaseServiceAuthenticatedSubjectContext(
+          authorizationSubjectScopeID: fixture.subjectScopeID,
+          serviceShutdownAuthorized: true
+        ),
+        configuration: remoteConfiguration
+      )
+      let transport = BlockingLoopbackDesignDatabaseServiceWireTransport(
+        dispatcher: dispatcher,
+        codecBudget: remoteConfiguration.wireCodecBudget,
+        blockingOperation: operation
+      )
+      return (
+        RemoteDesignDatabaseService(
+          transport: transport,
+          configuration: remoteConfiguration
+        ),
+        transport
+      )
+    }
+
+    let lateOpen = try makeService(blocking: .openSession)
+    let openingTask = Task {
+      try await lateOpen.remote.openSession(
+        configuration: DesignDatabaseServiceSessionConfiguration(
+          leaseDuration: .seconds(60),
+          maximumInFlightOperationCount: 2
+        )
+      )
+    }
+    await lateOpen.transport.waitUntilBlocked()
+    let lateOpenShutdownTask = Task {
+      try await lateOpen.remote.shutdown()
+    }
+    await Task.yield()
+    await lateOpen.transport.releaseBlockedOperation()
+    await #expect(throws: DesignDatabaseServiceError.closed) {
+      _ = try await openingTask.value
+    }
+    #expect(try await lateOpenShutdownTask.value == .closed)
+    #expect(
+      await lateOpen.transport.observedOperations == [
+        .openSession,
+        .closeSession,
+        .shutdown,
+      ]
+    )
+
+    let singleFlight = try makeService(blocking: .shutdown)
+    let firstShutdownTask = Task {
+      try await singleFlight.remote.shutdown()
+    }
+    await singleFlight.transport.waitUntilBlocked()
+    let secondShutdownTask = Task {
+      try await singleFlight.remote.shutdown()
+    }
+    await Task.yield()
+    await singleFlight.transport.releaseBlockedOperation()
+    #expect(try await firstShutdownTask.value == .closed)
+    #expect(try await secondShutdownTask.value == .closed)
+    #expect(try await singleFlight.remote.shutdown() == .alreadyClosed)
+    #expect(
+      await singleFlight.transport.observedOperations.filter { $0 == .shutdown }.count == 1
+    )
   }
 
   @Test
@@ -1534,6 +1666,32 @@ private actor ServiceTestHandle:
   }
 }
 
+private func readProcessID(at url: URL) async throws -> pid_t {
+  for _ in 0..<100 {
+    if let data = FileManager.default.contents(atPath: url.path),
+       let text = String(data: data, encoding: .utf8),
+       let processID = pid_t(text.trimmingCharacters(in: .whitespacesAndNewlines)) {
+      return processID
+    }
+    try await Task.sleep(for: .milliseconds(10))
+  }
+  throw DesignDatabaseServiceWireTransportError.inputOutputFailure(
+    reason: "The process fixture did not publish its process ID."
+  )
+}
+
+private func processIsGone(_ processID: pid_t) async -> Bool {
+  for _ in 0..<100 {
+    if kill(processID, 0) == -1, errno == ESRCH { return true }
+    do {
+      try await Task.sleep(for: .milliseconds(10))
+    } catch {
+      return false
+    }
+  }
+  return false
+}
+
 private struct ServiceTestCommitRecord: Sendable {
   let requestDigest: ContentDigest
   let status: DesignCommitStatus
@@ -1596,6 +1754,79 @@ private actor LoopbackDesignDatabaseServiceWireTransport:
       }
     }
     return responseFrame
+  }
+
+  func close() async throws(DesignDatabaseServiceWireTransportError) {
+    isClosed = true
+  }
+}
+
+private actor BlockingLoopbackDesignDatabaseServiceWireTransport:
+  DesignDatabaseServiceWireTransport
+{
+  private let dispatcher: DesignDatabaseServiceRemoteDispatcher
+  private let codecBudget: DesignDatabaseServiceWireCodecBudget
+  private let blockingOperation: DesignDatabaseServiceWireOperation
+  private var blockedContinuation: CheckedContinuation<Void, Never>?
+  private var blockedWaiters: [CheckedContinuation<Void, Never>] = []
+  private var didBlock = false
+  private var isClosed = false
+  private(set) var observedOperations: [DesignDatabaseServiceWireOperation] = []
+
+  init(
+    dispatcher: DesignDatabaseServiceRemoteDispatcher,
+    codecBudget: DesignDatabaseServiceWireCodecBudget,
+    blockingOperation: DesignDatabaseServiceWireOperation
+  ) {
+    self.dispatcher = dispatcher
+    self.codecBudget = codecBudget
+    self.blockingOperation = blockingOperation
+  }
+
+  func exchange(
+    _ requestFrame: [UInt8],
+    timeout: Duration
+  ) async throws(DesignDatabaseServiceWireTransportError) -> [UInt8] {
+    guard !isClosed else { throw .closed }
+    guard timeout > .zero else { throw .deadlineExceeded }
+    let request: DesignDatabaseServiceWireMessage
+    do {
+      request = try DesignDatabaseServiceWireCodec.decode(
+        requestFrame,
+        budget: codecBudget
+      )
+    } catch let error {
+      throw .invalidFrame(error)
+    }
+    observedOperations.append(request.operation)
+    let responseFrame: [UInt8]
+    do {
+      responseFrame = try await dispatcher.dispatch(requestFrame)
+    } catch let error {
+      throw .invalidFrame(error)
+    }
+    if request.operation == blockingOperation, !didBlock {
+      didBlock = true
+      let waiters = blockedWaiters
+      blockedWaiters.removeAll(keepingCapacity: false)
+      for waiter in waiters { waiter.resume() }
+      await withCheckedContinuation { continuation in
+        blockedContinuation = continuation
+      }
+    }
+    return responseFrame
+  }
+
+  func waitUntilBlocked() async {
+    guard !didBlock else { return }
+    await withCheckedContinuation { continuation in
+      blockedWaiters.append(continuation)
+    }
+  }
+
+  func releaseBlockedOperation() {
+    blockedContinuation?.resume()
+    blockedContinuation = nil
   }
 
   func close() async throws(DesignDatabaseServiceWireTransportError) {

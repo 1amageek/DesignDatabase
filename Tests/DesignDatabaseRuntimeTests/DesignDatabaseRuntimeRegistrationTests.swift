@@ -2633,6 +2633,52 @@ struct DesignDatabaseRuntimeRegistrationTests {
     #expect(await provider.close() == .closed)
   }
 
+  @Test("Provider close drains admitted opens and is single-flight")
+  func providerCloseDrainsAdmittedOpenAndIsSingleFlight() async throws {
+    let registration = try DesignDatabaseRuntimeRegistrationBuilder().build(
+      schemaVersion: Schema.Version(1, 0, 0),
+      contributions: [
+        try contribution(
+          id: "lsi.logic",
+          digestByte: "1",
+          entity: RuntimeTestLogicEntity.self
+        ),
+      ]
+    )
+    let authorizer = BlockingRuntimeTestAuthorizer()
+    let subjectScopeID = try DesignAuthorizationSubjectScopeID(high: 71, low: 72)
+    let provider = DesignDatabaseRuntimeProvider(
+      registration: registration,
+      containerProvider: SecurityEnabledContainerProvider(),
+      authorizationSubjectScopeID: subjectScopeID,
+      creationRequestedAuthorization: DesignDatabaseAuthorizationGrantSet([]),
+      authorizer: authorizer
+    )
+    let request = DesignDatabaseOpenRequest(
+      locator: try DesignDatabaseLocator(
+        namespace: "workspace",
+        segments: ["provider-close-drain"]
+      ),
+      expectedDatabaseID: try DesignDatabaseID(high: 73, low: 74),
+      requiredFeatureCapabilities: try DesignCapabilitySet([]),
+      requestedAuthorization: DesignDatabaseAuthorizationGrantSet([.read])
+    )
+
+    let openTask = Task { try await provider.open(request) }
+    await authorizer.waitUntilEntered()
+    let firstCloseTask = Task { await provider.close() }
+    let secondCloseTask = Task { await provider.close() }
+    await Task.yield()
+    await authorizer.release()
+
+    await #expect(throws: DesignDatabaseError.closed) {
+      _ = try await openTask.value
+    }
+    #expect(await firstCloseTask.value == .closed)
+    #expect(await secondCloseTask.value == .closed)
+    #expect(await provider.close() == .alreadyClosed)
+  }
+
   @Test("Production provider rejects a host that omits the runtime storage role")
   func productionProviderRejectsMissingRuntimeStorageRole() async throws {
     let registration = try DesignDatabaseRuntimeRegistrationBuilder().build(
@@ -6698,6 +6744,43 @@ private struct AllowingRuntimeTestAuthorizer: DesignDatabaseAuthorizing {
     _ grant: DesignDatabaseAuthorizationGrant,
     for subjectScopeID: DesignAuthorizationSubjectScopeID
   ) async throws(DesignDatabaseError) {}
+}
+
+private actor BlockingRuntimeTestAuthorizer: DesignDatabaseAuthorizing {
+  private var entered = false
+  private var releaseContinuation: CheckedContinuation<Void, Never>?
+  private var enteredWaiters: [CheckedContinuation<Void, Never>] = []
+
+  func authorizeRequestedGrants(
+    _ requestedGrants: DesignDatabaseAuthorizationGrantSet,
+    for subjectScopeID: DesignAuthorizationSubjectScopeID
+  ) async throws(DesignDatabaseError) -> DesignDatabaseAuthorizationGrantSet {
+    entered = true
+    let waiters = enteredWaiters
+    enteredWaiters.removeAll(keepingCapacity: false)
+    for waiter in waiters { waiter.resume() }
+    await withCheckedContinuation { continuation in
+      releaseContinuation = continuation
+    }
+    return requestedGrants
+  }
+
+  func authorize(
+    _ grant: DesignDatabaseAuthorizationGrant,
+    for subjectScopeID: DesignAuthorizationSubjectScopeID
+  ) async throws(DesignDatabaseError) {}
+
+  func waitUntilEntered() async {
+    guard !entered else { return }
+    await withCheckedContinuation { continuation in
+      enteredWaiters.append(continuation)
+    }
+  }
+
+  func release() {
+    releaseContinuation?.resume()
+    releaseContinuation = nil
+  }
 }
 
 private struct StorageRoleRejectingRuntimeTestAuthorizer:

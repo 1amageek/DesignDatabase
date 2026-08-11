@@ -7,7 +7,7 @@ public actor DesignDatabaseServiceProcessWireTransport:
     case frame([UInt8])
   }
 
-  private let process: Process
+  private let processOwner: DesignDatabaseServiceProcessOwner
   private let requestHandle: FileHandle
   private let responseHandle: FileHandle
   private var responseIterator: FileHandle.AsyncBytes.Iterator
@@ -16,6 +16,13 @@ public actor DesignDatabaseServiceProcessWireTransport:
   private var exchangeIsAvailable = true
   private var exchangeWaiters: [CheckedContinuation<Void, Never>] = []
   private var isClosed = false
+  private var closeIsInProgress = false
+  private var closeWaiters: [
+    CheckedContinuation<
+      Result<Void, DesignDatabaseServiceWireTransportError>,
+      Never
+    >
+  ] = []
   private var deadlineExpired = false
 
   public init(
@@ -35,27 +42,15 @@ public actor DesignDatabaseServiceProcessWireTransport:
         reason: "A process transport close grace period must be greater than zero."
       )
     }
-    let process = Process()
-    let requestPipe = Pipe()
-    let responsePipe = Pipe()
-    process.executableURL = executableURL
-    process.arguments = arguments
-    if let environment { process.environment = environment }
-    process.standardInput = requestPipe
-    process.standardOutput = responsePipe
-    process.standardError = FileHandle.standardError
-    do {
-      try process.run()
-      try requestPipe.fileHandleForReading.close()
-      try responsePipe.fileHandleForWriting.close()
-    } catch {
-      if process.isRunning { process.terminate() }
-      throw .inputOutputFailure(reason: String(describing: error))
-    }
-    self.process = process
-    self.requestHandle = requestPipe.fileHandleForWriting
-    self.responseHandle = responsePipe.fileHandleForReading
-    self.responseIterator = responsePipe.fileHandleForReading.bytes
+    let launch = try DesignDatabaseServiceProcessOwner.launch(
+      executableURL: executableURL,
+      arguments: arguments,
+      environment: environment
+    )
+    self.processOwner = launch.owner
+    self.requestHandle = launch.requestHandle
+    self.responseHandle = launch.responseHandle
+    self.responseIterator = launch.responseHandle.bytes
       .makeAsyncIterator()
     self.maximumFrameByteCount = maximumFrameByteCount
     self.closeGracePeriod = closeGracePeriod
@@ -68,7 +63,7 @@ public actor DesignDatabaseServiceProcessWireTransport:
     guard timeout > .zero else { throw .deadlineExceeded }
     await acquireExchange()
     defer { releaseExchange() }
-    guard !isClosed, process.isRunning else { throw .closed }
+    guard !isClosed, processOwner.isRunning else { throw .closed }
     let encoded = try DesignDatabaseServiceLengthPrefixedFrameIO.encoded(
       requestFrame,
       maximumFrameByteCount: maximumFrameByteCount
@@ -78,7 +73,7 @@ public actor DesignDatabaseServiceProcessWireTransport:
     } catch {
       let primaryReason = String(describing: error)
       do {
-        try closeResources()
+        try await closeResources()
       } catch let closeError {
         throw .inputOutputFailure(
           reason: "Process request write failed with \(primaryReason); cleanup also failed with \(closeError)."
@@ -114,7 +109,7 @@ public actor DesignDatabaseServiceProcessWireTransport:
     } catch {
       let primaryReason = String(describing: error)
       do {
-        try closeResources()
+        try await closeResources()
       } catch let closeError {
         throw .inputOutputFailure(
           reason: "Process response read failed with \(primaryReason); cleanup also failed with \(closeError)."
@@ -125,8 +120,10 @@ public actor DesignDatabaseServiceProcessWireTransport:
   }
 
   public func close() async throws(DesignDatabaseServiceWireTransportError) {
-    guard !isClosed else { return }
-    isClosed = true
+    guard beginClose() else {
+      try await waitForCloseIfNeeded()
+      return
+    }
     var failures: [String] = []
     do {
       try requestHandle.close()
@@ -134,36 +131,27 @@ public actor DesignDatabaseServiceProcessWireTransport:
       failures.append("request close: \(error)")
     }
 
-    let clock = ContinuousClock()
-    let deadline = clock.now.advanced(by: closeGracePeriod)
-    while process.isRunning, clock.now < deadline {
-      do {
-        try await clock.sleep(for: .milliseconds(10))
-      } catch {
-        failures.append("graceful close wait: \(error)")
-        break
-      }
-    }
-    if process.isRunning {
-      process.terminate()
-      failures.append(
-        "child process did not exit within \(closeGracePeriod)"
-      )
+    if let terminationFailure = await terminateAndReap(
+      initialGracePeriod: closeGracePeriod
+    ) {
+      failures.append(terminationFailure)
     }
     do {
       try responseHandle.close()
     } catch {
       failures.append("response close: \(error)")
     }
-    guard failures.isEmpty else {
-      throw .inputOutputFailure(reason: failures.joined(separator: "; "))
-    }
+    let result = closeResult(failures)
+    completeClose(with: result)
+    try result.get()
   }
 
   private func closeResources()
-    throws(DesignDatabaseServiceWireTransportError) {
-    guard !isClosed else { return }
-    isClosed = true
+    async throws(DesignDatabaseServiceWireTransportError) {
+    guard beginClose() else {
+      try await waitForCloseIfNeeded()
+      return
+    }
     var failures: [String] = []
     do {
       try requestHandle.close()
@@ -175,10 +163,14 @@ public actor DesignDatabaseServiceProcessWireTransport:
     } catch {
       failures.append("response close: \(error)")
     }
-    if process.isRunning { process.terminate() }
-    guard failures.isEmpty else {
-      throw .inputOutputFailure(reason: failures.joined(separator: "; "))
+    if let terminationFailure = await terminateAndReap(
+      initialGracePeriod: .zero
+    ) {
+      failures.append(terminationFailure)
     }
+    let result = closeResult(failures)
+    completeClose(with: result)
+    try result.get()
   }
 
   private func acquireExchange() async {
@@ -222,11 +214,12 @@ public actor DesignDatabaseServiceProcessWireTransport:
   }
 
   private func terminateForDeadline()
-    throws(DesignDatabaseServiceWireTransportError) {
-    guard !isClosed else { return }
+    async throws(DesignDatabaseServiceWireTransportError) {
     deadlineExpired = true
-    isClosed = true
-    if process.isRunning { process.terminate() }
+    guard beginClose() else {
+      try await waitForCloseIfNeeded()
+      return
+    }
     var failures: [String] = []
     do {
       try requestHandle.close()
@@ -238,10 +231,73 @@ public actor DesignDatabaseServiceProcessWireTransport:
     } catch {
       failures.append("response close: \(error)")
     }
-    guard failures.isEmpty else {
-      throw .inputOutputFailure(
+    if let terminationFailure = await terminateAndReap(
+      initialGracePeriod: .zero
+    ) {
+      failures.append(terminationFailure)
+    }
+    let result: Result<Void, DesignDatabaseServiceWireTransportError>
+    if failures.isEmpty {
+      result = .success(())
+    } else {
+      result = .failure(.inputOutputFailure(
         reason: "The request deadline expired and forced cleanup failed: \(failures.joined(separator: "; "))."
-      )
+      ))
+    }
+    completeClose(with: result)
+    try result.get()
+  }
+
+  private func beginClose() -> Bool {
+    guard !isClosed else { return false }
+    isClosed = true
+    closeIsInProgress = true
+    return true
+  }
+
+  private func waitForCloseIfNeeded()
+    async throws(DesignDatabaseServiceWireTransportError) {
+    guard closeIsInProgress else { return }
+    let result = await withCheckedContinuation { continuation in
+      closeWaiters.append(continuation)
+    }
+    try result.get()
+  }
+
+  private func closeResult(
+    _ failures: [String]
+  ) -> Result<Void, DesignDatabaseServiceWireTransportError> {
+    guard !failures.isEmpty else { return .success(()) }
+    return .failure(.inputOutputFailure(
+      reason: failures.joined(separator: "; ")
+    ))
+  }
+
+  private func completeClose(
+    with result: Result<Void, DesignDatabaseServiceWireTransportError>
+  ) {
+    closeIsInProgress = false
+    let waiters = closeWaiters
+    closeWaiters.removeAll(keepingCapacity: false)
+    for waiter in waiters {
+      waiter.resume(returning: result)
+    }
+  }
+
+  private func terminateAndReap(
+    initialGracePeriod: Duration
+  ) async -> String? {
+    let owner = processOwner
+    let signalGracePeriod = closeGracePeriod
+    return await withCheckedContinuation { continuation in
+      Thread {
+        continuation.resume(
+          returning: owner.terminateAndReap(
+            initialGracePeriod: initialGracePeriod,
+            signalGracePeriod: signalGracePeriod
+          )
+        )
+      }.start()
     }
   }
 }
