@@ -16,33 +16,44 @@ public struct DesignDatabaseRuntimeAttacher: Sendable {
     locator: DesignDatabaseLocator,
     registration: DesignDatabaseRuntimeRegistrationBundle
   ) async throws(DesignDatabaseRuntimeError) -> DesignDatabaseRuntimeAttachment {
-    let container = try await containerProvider.openContainer(
-      for: locator,
-      registration: registration
-    )
+    let owned: (any DesignDatabaseRuntimeOwnedContainer)?
+    let container: DBContainer
+    if let provider = containerProvider as? any DesignDatabaseRuntimeOwnedContainerProviding {
+      let resource = try await provider.openOwnedContainer(for: locator, registration: registration)
+      owned = resource
+      container = resource.container
+    } else {
+      owned = nil
+      container = try await containerProvider.openContainer(for: locator, registration: registration)
+    }
+    var attachment: DesignDatabaseRuntimeAttachment?
     do {
       let actualFingerprint = try Self.schemaFingerprint(container.schema)
       guard actualFingerprint == registration.schemaFingerprint else {
         throw DesignDatabaseRuntimeError.containerSchemaMismatch(
           expected: registration.schemaFingerprint.hexadecimalValue,
-          actual: actualFingerprint.hexadecimalValue
-        )
+          actual: actualFingerprint.hexadecimalValue)
       }
       try container.runtimeConfiguration.validate(schema: registration.schema)
-      let attachment = DesignDatabaseRuntimeAttachment(
-        locator: locator,
-        registration: registration,
-        container: container
-      )
-      try await attachment.validateCommitRecoveryBeforeServingOpens()
-      try await attachment.restoreCollectionAdmissionsBeforeServingOpens()
-      return attachment
-    } catch let error as DesignDatabaseRuntimeError {
-      await container.shutdown()
-      throw error
+      let opened = DesignDatabaseRuntimeAttachment(locator: locator, registration: registration,
+                                                   container: container, ownedContainer: owned)
+      attachment = opened
+      try await opened.validateCommitRecoveryBeforeServingOpens()
+      try await opened.restoreCollectionAdmissionsBeforeServingOpens()
+      return opened
     } catch {
-      await container.shutdown()
-      throw .frameworkConfigurationFailed(reason: String(describing: error))
+      let primary = error
+      if let attachment {
+        if case .cleanupFailed(let reason) = await attachment.close() {
+          throw .containerProviderFailed(reason: "Open failed: \(primary); cleanup failed: \(reason)")
+        }
+      } else {
+        await container.shutdown()
+        do { try await owned?.release() }
+        catch { throw .containerProviderFailed(reason: "Open failed: \(primary); cleanup failed: \(error)") }
+      }
+      if let runtime = primary as? DesignDatabaseRuntimeError { throw runtime }
+      throw .frameworkConfigurationFailed(reason: String(describing: primary))
     }
   }
 

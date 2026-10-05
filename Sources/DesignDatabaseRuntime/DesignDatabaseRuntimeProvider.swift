@@ -14,6 +14,7 @@ public actor DesignDatabaseRuntimeProvider: DesignDatabaseProviding {
   private let creationRequestedAuthorization: DesignDatabaseAuthorizationGrantSet
   private let authorizer: any DesignDatabaseAuthorizing
   private var handles: [DesignDatabaseRuntimeHandle] = []
+  private var cleanupAttachments: [DesignDatabaseRuntimeAttachment] = []
   private var lifecycle: Lifecycle = .open
   private var activeOperationCount = 0
   private var operationDrainWaiters: [CheckedContinuation<Void, Never>] = []
@@ -89,7 +90,6 @@ public actor DesignDatabaseRuntimeProvider: DesignDatabaseProviding {
       case .created:
         break
       case .outcomeUnknown(let unknown):
-        _ = await attachment.close()
         throw DesignDatabaseError.outcomeUnknown(
           operation: unknown.operation,
           requestDigest: unknown.requestDigest
@@ -100,7 +100,6 @@ public actor DesignDatabaseRuntimeProvider: DesignDatabaseProviding {
         requiredFeatureCapabilities: request.declaredFeatureCapabilities
       )
       guard lifecycle == .open else {
-        _ = await attachment.close()
         throw DesignDatabaseError.closed
       }
       let handle = DesignDatabaseRuntimeHandle(
@@ -113,19 +112,16 @@ public actor DesignDatabaseRuntimeProvider: DesignDatabaseProviding {
       handles.append(handle)
       return handle
     } catch let error as DesignDatabaseError {
-      _ = await attachment.close()
-      throw error
+      throw await closeAfterFailedOpen(attachment, primary: error)
     } catch let error as DesignDatabaseRuntimeError {
-      _ = await attachment.close()
-      throw Self.map(
+      throw await closeAfterFailedOpen(attachment, primary: Self.map(
         error,
         locator: request.locator,
         expectedDatabaseID: request.databaseID,
         operation: genesisRequest
-      )
+      ))
     } catch {
-      _ = await attachment.close()
-      throw .persistence(String(describing: error))
+      throw await closeAfterFailedOpen(attachment, primary: .persistence(String(describing: error)))
     }
   }
 
@@ -160,7 +156,6 @@ public actor DesignDatabaseRuntimeProvider: DesignDatabaseProviding {
         requiredFeatureCapabilities: request.requiredFeatureCapabilities
       )
       guard lifecycle == .open else {
-        _ = await attachment.close()
         throw DesignDatabaseError.closed
       }
       let handle = DesignDatabaseRuntimeHandle(
@@ -173,26 +168,24 @@ public actor DesignDatabaseRuntimeProvider: DesignDatabaseProviding {
       handles.append(handle)
       return handle
     } catch let error as DesignDatabaseError {
-      _ = await attachment.close()
-      throw error
+      throw await closeAfterFailedOpen(attachment, primary: error)
     } catch let error as DesignDatabaseRuntimeError {
-      _ = await attachment.close()
-      throw Self.map(
+      throw await closeAfterFailedOpen(attachment, primary: Self.map(
         error,
         locator: request.locator,
         expectedDatabaseID: request.expectedDatabaseID,
         operation: nil
-      )
+      ))
     } catch {
-      _ = await attachment.close()
-      throw .persistence(String(describing: error))
+      throw await closeAfterFailedOpen(attachment, primary: .persistence(String(describing: error)))
     }
   }
 
   public func close() async -> DesignDatabaseTermination {
     switch lifecycle {
     case .closed:
-      return .alreadyClosed
+      guard !handles.isEmpty || !cleanupAttachments.isEmpty else { return .alreadyClosed }
+      lifecycle = .closing
     case .closing:
       return await withCheckedContinuation { continuation in
         closeWaiters.append(continuation)
@@ -201,15 +194,41 @@ public actor DesignDatabaseRuntimeProvider: DesignDatabaseProviding {
       lifecycle = .closing
     }
     await waitForOperationsToDrain()
+    var cleanupFailures: [String] = []
+    var retainedHandles: [DesignDatabaseRuntimeHandle] = []
     for handle in handles {
-      _ = await handle.close()
+      if case .cleanupFailed(let reason) = await handle.close() {
+        cleanupFailures.append(reason)
+        retainedHandles.append(handle)
+      }
     }
-    handles.removeAll(keepingCapacity: false)
+    handles = retainedHandles
+    var retainedAttachments: [DesignDatabaseRuntimeAttachment] = []
+    for attachment in cleanupAttachments {
+      if case .cleanupFailed(let reason) = await attachment.close() {
+        cleanupFailures.append(reason)
+        retainedAttachments.append(attachment)
+      }
+    }
+    cleanupAttachments = retainedAttachments
     lifecycle = .closed
     let waiters = closeWaiters
     closeWaiters.removeAll(keepingCapacity: false)
-    for waiter in waiters { waiter.resume(returning: .closed) }
-    return .closed
+    let result: DesignDatabaseTermination = cleanupFailures.isEmpty ? .closed
+      : .cleanupFailed(reason: cleanupFailures.joined(separator: "; "))
+    for waiter in waiters { waiter.resume(returning: result) }
+    return result
+  }
+
+  private func closeAfterFailedOpen(
+    _ attachment: DesignDatabaseRuntimeAttachment,
+    primary: DesignDatabaseError
+  ) async -> DesignDatabaseError {
+    if case .cleanupFailed(let reason) = await attachment.close() {
+      cleanupAttachments.append(attachment)
+      return .persistence("Open failed: \(primary); owned resource cleanup failed: \(reason)")
+    }
+    return primary
   }
 
   private func openAttachment(

@@ -816,3 +816,33 @@ Declarations, package targets, or successful empty operations do not satisfy the
 The production path is complete only when the framework-backed implementation exhibits
 the same successful and failing design semantics as the Native reference and meets the
 retained performance budgets.
+
+## Owned container authority lifetime
+
+An optional `DesignDatabaseRuntimeOwnedContainerProviding` facet transfers a prepared
+`DesignDatabaseRuntimeOwnedContainer` resource to the attacher. The resource retains
+its host-owned backing lease until Runtime has drained operations, closed snapshots
+and shut down the container. Its `release()` completes the host cleanup and exposes
+cleanup failure. The attacher owns the same release responsibility when registration
+or persisted recovery admission fails.
+
+Only a resource conforming to `DesignDatabaseRuntimeExclusiveMaintenanceContainer`
+admits public revision collection. This resource contract requires exclusive access
+among every participating open for the backing throughout its lifetime. The host
+issues that resource after actual exclusion succeeds; a caller configuration boolean
+or authorization grant cannot replace it. Legacy container providers remain usable
+for ordinary operations but cannot collect revisions. Shared or remote profiles must
+route every reader and collector through one qualified authority or remain unsupported.
+
+```text
+host backing exclusion -> owned container -> attachment recovery -> handle / snapshots
+    -> bounded authenticated collection -> operations drain -> snapshots close
+    -> container shutdown -> host authority release
+```
+
+The public maintenance adapter reuses the existing package admission, sweep and
+startup recovery. Every collection request is bound to the handle database and
+authenticated subject scope; administrator status may inspect another exact subject
+operation in that database. One call performs at most one bounded sweep transaction.
+Status validates persisted claim, intent and physical directory without deleting data.
+Existing operation/intent digests and immutable schema rows retain their encoding.

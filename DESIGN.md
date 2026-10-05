@@ -494,3 +494,14 @@ sequenceDiagram
 Until this framework-backed path and at least one real domain vertical slice pass their
 success, failure, recovery, and performance gates, DesignDatabase is not production
 ready.
+
+## Qualified public revision collection
+
+The [maintenance facet](INTERFACES.md#qualified-revision-collection) admits bounded
+exact revision collection only on a live exclusive container authority. Runtime owns
+request validation, authorization, snapshot leases, persisted admission, bounded sweep
+and recovery; the host owns backing selection and the resource lease establishing
+exclusive participating access. A grant never fabricates an unavailable authority.
+The [Runtime lifetime contract](DATABASE_FRAMEWORK_RUNTIME_ARCHITECTURE.md#owned-container-authority-lifetime)
+separates container shutdown from release of that authority. Legacy providers and remote
+profiles without this contract return typed unsupported maintenance.

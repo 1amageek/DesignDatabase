@@ -928,3 +928,37 @@ identifies categories, not permission to replace structured failures with string
 
 Backward compatibility with the current experimental API is not required. Removal or
 replacement occurs only with success/failure behavioral tests and updated documentation.
+
+## Qualified revision collection
+
+`DesignDatabaseMaintenanceHandle` exposes `collectRevisions(_:budget:)` and
+`revisionCollectionStatus(operation:requestDigest:budget:)`. Both revalidate
+`administer` on every operation. Status is global maintenance reconciliation,
+following the existing commit-abandonment status facet; it can inspect exact operations
+from another subject scope only under `administer`. It is not caller-owned outcome
+inspection. Collection additionally requires the authenticated subject scope to match
+the request operation. Operation references and digests are not credentials.
+Collection requires a host-owned live container
+conforming to the exclusive maintenance resource contract. Ordinary design handles
+and feature capability declarations do not establish this authority. Unsupported
+profiles fail with `unsupportedCapability("design-database.revision-collection")`.
+
+| Input / result | Contract |
+|---|---|
+| Request | Exact database and authenticated subject-scoped operation, nonempty unique sorted revisions, canonical SHA-256 request digest |
+| Budget | Positive explicit limits for candidates, persisted root audit, physical identities, scan pages, generation retries and one deletion batch |
+| Progress | Exact operation/request identity, monotonic deleted/total physical identity counts and authenticated intent digest |
+| Collected receipt | Exact candidate revisions, root/directory digests, physical identity count, admission/completion reachability generations and terminal intent digest |
+| Unknown | No completion claim; reconcile the same operation and digest before another bounded step |
+| Status | Read-only persisted operation reconciliation; no unrecorded operation is reported as admitted |
+
+The request digest retains the existing Runtime collection-admission encoding. Budgets
+do not alter target identity and may be tightened or expanded within Runtime transaction
+ceilings between steps. Neither physical storage keys nor framework models escape the
+maintenance facet. Rooted revisions produce a typed exact revision/root refusal.
+
+Verification belongs to Runtime tests: real candidate publication, active retention
+refusal, exact release followed by bounded deletion and terminal retry, active snapshot
+refusal, missing/revoked grant, unqualified provider, scoped request mismatch, recovery,
+status and container-before-authority cleanup. Actual host OS exclusion remains the
+host provider's separate proof obligation; a test resource lease cannot qualify it.

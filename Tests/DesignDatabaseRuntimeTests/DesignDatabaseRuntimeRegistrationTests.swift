@@ -1087,6 +1087,186 @@ struct DesignDatabaseRuntimeRegistrationTests {
     #expect(await attachment.close() == .closed)
   }
 
+  @Test("Public collection respects real retention, leases, scoped status and bounded terminal retry")
+  func publicCollectionRespectsRetentionAndCompletes() async throws {
+    let (unused, registration, locator) = try await makeMutableAttachment()
+    #expect(await unused.close() == .closed)
+    let path = FileManager.default.temporaryDirectory.appendingPathComponent("public-collection-\(UUID().uuidString).sqlite").path
+    defer {
+      do { try FileManager.default.removeItem(atPath: path) }
+      catch { Issue.record("Public collection fixture cleanup failed: \(error)") }
+    }
+    let authorizer = RevocableCollectionTestAuthorizer()
+    let releaseState = CollectionTestReleaseState()
+    let provider = TestCollectionOwnedProvider(databasePath: path, releaseState: releaseState)
+    let create = try genesisRequest(locator: locator, designSchemaBundle: registration.designSchemaBundle,
+                                    registrationDigest: registration.registrationDigest, operation: "public-create", genesisLow: 731)
+    let runtime = DesignDatabaseRuntimeProvider(registration: registration, containerProvider: provider,
+      authorizationSubjectScopeID: create.authorizationSubjectScopeID,
+      creationRequestedAuthorization: DesignDatabaseAuthorizationGrantSet([.read, .proposeCandidate, .retain, .administer, .inspectOwnOperationOutcome]),
+      authorizer: authorizer)
+    let handle = try await runtime.create(DesignDatabaseCreateRequest(locator: locator,
+      databaseID: create.databaseID, genesisRevisionID: create.genesisRevisionID,
+      operationID: create.operationID, initialSchemaBundle: registration.designSchemaBundle,
+      declaredFeatureCapabilities: create.declaredFeatureCapabilities, requestDigest: create.requestDigest))
+    let maintenance = try #require(handle as? any DesignDatabaseMaintenanceHandle)
+    let base = try await handle.resolve(.named(.main))
+    let baseSnapshot = try await handle.openSnapshot(at: base)
+    let submission = try mutationSubmission(operation: "public-candidate", payload: Array("candidate".utf8),
+      databaseID: handle.databaseID, baseRevision: base, schemaBundleDigest: registration.designSchemaBundleDigest,
+      dependencyRootDigest: baseSnapshot.dependencyRootDigest,
+      dependencyGraphDigest: baseSnapshot.semanticDependencyGraphDigest)
+    #expect(await baseSnapshot.close() == .closed)
+    guard case .committed(let commit) = try await handle.submit(submission) else {
+      Issue.record("The real candidate must commit before collection."); _ = await handle.close(); return
+    }
+    let operation = DesignDatabaseOperationReference(databaseID: handle.databaseID,
+      authorizationSubjectScopeID: handle.authorizationSubjectScopeID,
+      operationID: try DesignDatabaseOperationID(rawValue: "public-collect"))
+    let revisions = [commit.candidateRevision]
+    let hash = try DesignRevisionCollectionDigest.request(operation: operation, revisions: revisions, using: SHA256ContentDigester())
+    let request = try DesignRevisionCollectionRequest(operation: operation, revisions: revisions, requestDigest: hash)
+    let internalRequest = try DesignDatabaseRuntimeCollectionAdmissionRequest(operation: operation,
+      candidates: DesignDatabaseRuntimeRevisionDeletionCandidateSet(revisions: revisions), using: SHA256ContentDigester())
+    #expect(internalRequest.requestDigest == hash)
+    let budget = try DesignRevisionCollectionBudget(maximumPhysicalDeletionCount: 1)
+    let otherScope = try DesignAuthorizationSubjectScopeID(high: 91, low: 92)
+    let foreignOperation = DesignDatabaseOperationReference(databaseID: handle.databaseID,
+      authorizationSubjectScopeID: otherScope, operationID: operation.operationID)
+    let foreignRequest = try DesignRevisionCollectionRequest(operation: foreignOperation, revisions: revisions,
+      requestDigest: DesignRevisionCollectionDigest.request(operation: foreignOperation, revisions: revisions, using: SHA256ContentDigester()))
+    await #expect(throws: DesignDatabaseError.unauthorized(grant: .administer, subjectScopeID: handle.authorizationSubjectScopeID)) {
+      _ = try await maintenance.collectRevisions(foreignRequest, budget: budget)
+    }
+    let badRequest = try DesignRevisionCollectionRequest(operation: operation, revisions: revisions, requestDigest: digest(repeating: "f"))
+    await #expect(throws: (any Error).self) { _ = try await maintenance.collectRevisions(badRequest, budget: budget) }
+    let oversized = try DesignRevisionCollectionBudget(maximumPhysicalDeletionCount: UInt64.max)
+    await #expect(throws: DesignDatabaseError.resourceExhausted(
+      limit: (DesignDatabaseRuntimeCommitBuildIntent.stagingTransactionWriteLimit - 1) / 2, requested: UInt64.max)) {
+      _ = try await maintenance.collectRevisions(request, budget: oversized)
+    }
+    #expect(try await maintenance.revisionCollectionStatus(operation: operation, requestDigest: hash, budget: budget) == .notRecorded)
+    let readOnly = try await runtime.open(DesignDatabaseOpenRequest(locator: locator, expectedDatabaseID: handle.databaseID,
+      requiredFeatureCapabilities: try DesignCapabilitySet([]), requestedAuthorization: DesignDatabaseAuthorizationGrantSet([.read])))
+    let readOnlyMaintenance = try #require(readOnly as? any DesignDatabaseMaintenanceHandle)
+    await #expect(throws: DesignDatabaseError.unauthorized(grant: .administer, subjectScopeID: handle.authorizationSubjectScopeID)) {
+      _ = try await readOnlyMaintenance.revisionCollectionStatus(operation: operation, requestDigest: hash, budget: budget)
+    }
+    #expect(await readOnly.close() == .closed)
+    let claimID = try DesignRevisionRetentionID(rawValue: "public-candidate-review")
+    let retain = try retentionRequest(operation: "public-retain", claimID: claimID, revision: commit.candidateRevision)
+    guard case .applied(let retained) = try await handle.retain(retain) else {
+      Issue.record("The exact candidate retention must apply."); _ = await handle.close(); return
+    }
+    await #expect(throws: DesignDatabaseError.revisionStillReachable(revision: commit.candidateRevision, rootKind: "retention:" + claimID.rawValue)) {
+      _ = try await maintenance.collectRevisions(request, budget: budget)
+    }
+    #expect(try await maintenance.revisionCollectionStatus(operation: operation, requestDigest: hash, budget: budget) == .notRecorded)
+    _ = try await handle.releaseRetention(retentionReleaseRequest(operation: "public-release", claimID: claimID,
+      revision: commit.candidateRevision, generation: retained.generation))
+    let snapshot = try await handle.openSnapshot(at: commit.candidateRevision)
+    await #expect(throws: DesignDatabaseError.revisionDeleting(commit.candidateRevision)) {
+      _ = try await maintenance.collectRevisions(request, budget: budget)
+    }
+    #expect(await snapshot.close() == .closed)
+    var result = try await maintenance.collectRevisions(request, budget: budget)
+    var previous: UInt64 = 0
+    for _ in 0..<512 {
+      guard case .inProgress(let progress) = result else { break }
+      #expect(progress.operation == operation && progress.requestDigest == hash)
+      #expect(progress.deletedPhysicalIdentityCount >= previous)
+      #expect(progress.deletedPhysicalIdentityCount - previous <= 1)
+      previous = progress.deletedPhysicalIdentityCount
+      #expect(try await maintenance.revisionCollectionStatus(operation: operation, requestDigest: hash, budget: budget) == result)
+      result = try await maintenance.collectRevisions(request, budget: budget)
+    }
+    guard case .collected(let receipt) = result else {
+      Issue.record("Bounded steps must reach terminal collection."); _ = await handle.close(); return
+    }
+    #expect(receipt.revisions == revisions && receipt.operation == operation && receipt.requestDigest == hash)
+    #expect(try await maintenance.collectRevisions(request, budget: budget) == result)
+    #expect(try await maintenance.revisionCollectionStatus(operation: operation, requestDigest: hash, budget: budget) == result)
+    await #expect(throws: DesignDatabaseError.revisionCollected(commit.candidateRevision)) {
+      _ = try await handle.openSnapshot(at: commit.candidateRevision)
+    }
+    let changedHash = try DesignRevisionCollectionDigest.request(operation: operation, revisions: [base], using: SHA256ContentDigester())
+    let changedRequest = try DesignRevisionCollectionRequest(operation: operation, revisions: [base], requestDigest: changedHash)
+    await #expect(throws: DesignDatabaseError.idempotencyConflict(operation: operation)) {
+      _ = try await maintenance.collectRevisions(changedRequest, budget: budget)
+    }
+    await authorizer.revoke()
+    await #expect(throws: DesignDatabaseError.unauthorized(grant: .administer, subjectScopeID: handle.authorizationSubjectScopeID)) {
+      _ = try await maintenance.revisionCollectionStatus(operation: operation, requestDigest: hash, budget: budget)
+    }
+    #expect(try await handle.resolve(.named(.main)) == base)
+    #expect(await handle.close() == .closed)
+    #expect(await runtime.close() == .closed)
+    let reopenedRuntime = DesignDatabaseRuntimeProvider(registration: registration, containerProvider: provider,
+      authorizationSubjectScopeID: otherScope,
+      creationRequestedAuthorization: DesignDatabaseAuthorizationGrantSet([]),
+      authorizer: AllowingRuntimeTestAuthorizer())
+    let reopenedHandle = try await reopenedRuntime.open(DesignDatabaseOpenRequest(locator: locator,
+      expectedDatabaseID: create.databaseID, requiredFeatureCapabilities: try DesignCapabilitySet([]),
+      requestedAuthorization: DesignDatabaseAuthorizationGrantSet([.administer])))
+    let reopenedMaintenance = try #require(reopenedHandle as? any DesignDatabaseMaintenanceHandle)
+    #expect(try await reopenedMaintenance.revisionCollectionStatus(operation: operation, requestDigest: hash, budget: budget) == result)
+    #expect(await reopenedHandle.close() == .closed)
+    #expect(await reopenedRuntime.close() == .closed)
+    let ordinary = DesignDatabaseRuntimeProvider(registration: registration,
+      containerProvider: ReopenableSQLiteContainerProvider(databasePath: path),
+      authorizationSubjectScopeID: create.authorizationSubjectScopeID,
+      creationRequestedAuthorization: DesignDatabaseAuthorizationGrantSet([]), authorizer: AllowingRuntimeTestAuthorizer())
+    let ordinaryHandle = try await ordinary.open(DesignDatabaseOpenRequest(locator: locator,
+      expectedDatabaseID: create.databaseID, requiredFeatureCapabilities: try DesignCapabilitySet([]),
+      requestedAuthorization: DesignDatabaseAuthorizationGrantSet([.administer])))
+    let ordinaryMaintenance = try #require(ordinaryHandle as? any DesignDatabaseMaintenanceHandle)
+    let unsupported = DesignDatabaseError.unsupportedCapability(try DesignCapabilityID(rawValue: "design-database.revision-collection"))
+    await #expect(throws: unsupported) {
+      _ = try await ordinaryMaintenance.collectRevisions(request, budget: budget)
+    }
+    await #expect(throws: unsupported) {
+      _ = try await ordinaryMaintenance.revisionCollectionStatus(operation: operation, requestDigest: hash, budget: budget)
+    }
+    #expect(await ordinary.close() == .closed)
+    #expect(await releaseState.count == 3)
+
+  }
+
+  @Test("Owned authority release follows SQLite shutdown and failed cleanup remains retryable")
+  func ownedCollectionAuthorityCloseRetriesCleanup() async throws {
+    let (unused, registration, locator) = try await makeMutableAttachment()
+    #expect(await unused.close() == .closed)
+    let path = FileManager.default.temporaryDirectory.appendingPathComponent("collection-close-\(UUID().uuidString).sqlite").path
+    defer {
+      do { try FileManager.default.removeItem(atPath: path) }
+      catch { Issue.record("Collection close fixture cleanup failed: \(error)") }
+    }
+    let state = CollectionTestReleaseState(failFirst: true)
+    let create = try genesisRequest(locator: locator, designSchemaBundle: registration.designSchemaBundle,
+      registrationDigest: registration.registrationDigest, operation: "collection-close", genesisLow: 732)
+    let runtime = DesignDatabaseRuntimeProvider(registration: registration,
+      containerProvider: TestCollectionOwnedProvider(databasePath: path, releaseState: state),
+      authorizationSubjectScopeID: create.authorizationSubjectScopeID,
+      creationRequestedAuthorization: DesignDatabaseAuthorizationGrantSet([.read, .administer]),
+      authorizer: AllowingRuntimeTestAuthorizer())
+    let handle = try await runtime.create(DesignDatabaseCreateRequest(locator: locator,
+      databaseID: create.databaseID, genesisRevisionID: create.genesisRevisionID,
+      operationID: create.operationID, initialSchemaBundle: registration.designSchemaBundle,
+      declaredFeatureCapabilities: create.declaredFeatureCapabilities, requestDigest: create.requestDigest))
+    let snapshot = try await handle.openSnapshot(at: handle.genesisRevision)
+    guard case .cleanupFailed(let reason) = await runtime.close() else {
+      Issue.record("Owned release failure must remain visible."); return
+    }
+    #expect(reason.contains("lease-release-test-failure"))
+    #expect(await snapshot.close() == .alreadyClosed)
+    await #expect(throws: DesignDatabaseError.closed) { _ = try await handle.resolve(.named(.main)) }
+    #expect(await state.count == 1)
+    #expect(await runtime.close() == .closed)
+    #expect(await state.count == 2)
+    #expect(await runtime.close() == .alreadyClosed)
+    #expect(await state.count == 2)
+  }
+
   @Test("Collection admission protects roots and atomically fences an unreferenced candidate")
   func collectionAdmissionProtectsRootsAndFencesCandidate() async throws {
     let (attachment, registration, locator) = try await makeMutableAttachment()
@@ -6809,5 +6989,57 @@ private struct StorageRoleRejectingRuntimeTestAuthorizer:
         "The public authorizer inherited the internal Runtime storage role."
       )
     }
+  }
+}
+
+// This resource tests the lower public contract; host OS exclusion is verified separately.
+private struct TestCollectionOwnedProvider: DesignDatabaseRuntimeOwnedContainerProviding {
+  let databasePath: String
+  var releaseState: CollectionTestReleaseState? = nil
+  func openContainer(for locator: DesignDatabaseLocator, registration: DesignDatabaseRuntimeRegistrationBundle)
+    async throws(DesignDatabaseRuntimeError) -> DBContainer {
+    try await ReopenableSQLiteContainerProvider(databasePath: databasePath,
+      security: .enabled(adminRoles: [DesignDatabaseRuntimeStorageSecurity.administratorRole]))
+      .openContainer(for: locator, registration: registration)
+  }
+  func openOwnedContainer(for locator: DesignDatabaseLocator, registration: DesignDatabaseRuntimeRegistrationBundle)
+    async throws(DesignDatabaseRuntimeError) -> any DesignDatabaseRuntimeOwnedContainer {
+    let container = try await openContainer(for: locator, registration: registration)
+    return TestCollectionOwnedContainer(container: container, releaseState: releaseState)
+  }
+}
+private actor TestCollectionOwnedContainer: DesignDatabaseRuntimeExclusiveMaintenanceContainer {
+  nonisolated let container: DBContainer
+  let releaseState: CollectionTestReleaseState?
+  init(container: DBContainer, releaseState: CollectionTestReleaseState?) {
+    self.container = container; self.releaseState = releaseState
+  }
+  func release() async throws(DesignDatabaseRuntimeError) { try await releaseState?.release(container: container) }
+}
+
+private actor CollectionTestReleaseState {
+  private(set) var count = 0
+  private let failFirst: Bool
+  init(failFirst: Bool = false) { self.failFirst = failFirst }
+  func release(container: DBContainer) async throws(DesignDatabaseRuntimeError) {
+    count += 1
+    do {
+      _ = try await container.newContext().withTransaction { _ in true }
+      throw DesignDatabaseRuntimeError.persistedStateCorrupt(reason: "The authority was released before container shutdown.")
+    } catch let error as DesignDatabaseRuntimeError { throw error }
+    catch {
+      // A real SQLite transaction must fail after its container shutdown.
+    }
+    if failFirst && count == 1 { throw .containerProviderFailed(reason: "lease-release-test-failure") }
+  }
+}
+
+private actor RevocableCollectionTestAuthorizer: DesignDatabaseAuthorizing {
+  private var revoked = false
+  func revoke() { revoked = true }
+  func authorizeRequestedGrants(_ grants: DesignDatabaseAuthorizationGrantSet,
+    for scope: DesignAuthorizationSubjectScopeID) async throws(DesignDatabaseError) -> DesignDatabaseAuthorizationGrantSet { grants }
+  func authorize(_ grant: DesignDatabaseAuthorizationGrant, for scope: DesignAuthorizationSubjectScopeID) async throws(DesignDatabaseError) {
+    if revoked && grant == .administer { throw .unauthorized(grant: grant, subjectScopeID: scope) }
   }
 }

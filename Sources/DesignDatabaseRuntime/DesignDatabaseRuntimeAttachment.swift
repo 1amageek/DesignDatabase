@@ -22,11 +22,20 @@ public actor DesignDatabaseRuntimeAttachment {
 
   private let container: DBContainer
   private var isClosed = false
+  private var isClosing = false
+  private var containerShutdownComplete = false
+  private var ownedContainer: (any DesignDatabaseRuntimeOwnedContainer)?
+  private var closeWaiters: [CheckedContinuation<DesignDatabaseRuntimeTermination, Never>] = []
+
+  package var hasExclusiveMaintenanceAuthority: Bool {
+    !isClosed && ownedContainer is any DesignDatabaseRuntimeExclusiveMaintenanceContainer
+  }
 
   package init(
     locator: DesignDatabaseLocator,
     registration: DesignDatabaseRuntimeRegistrationBundle,
-    container: DBContainer
+    container: DBContainer,
+    ownedContainer: (any DesignDatabaseRuntimeOwnedContainer)? = nil
   ) {
     self.locator = locator
     self.schemaFingerprint = registration.schemaFingerprint
@@ -38,15 +47,33 @@ public actor DesignDatabaseRuntimeAttachment {
     self.decodedProjectionPageCache = DesignProjectionDecodedPageCache()
     self.snapshotLeaseCoordinator = DesignDatabaseRuntimeLeaseCoordinator()
     self.container = container
+    self.ownedContainer = ownedContainer
   }
 
   public func close() async -> DesignDatabaseRuntimeTermination {
-    guard !isClosed else { return .alreadyClosed }
+    if isClosing {
+      return await withCheckedContinuation { closeWaiters.append($0) }
+    }
+    guard !isClosed || ownedContainer != nil else { return .alreadyClosed }
+    isClosing = true
     isClosed = true
-    await snapshotLeaseCoordinator.close()
-    decodedProjectionPageCache.close()
-    await container.shutdown()
-    return .closed
+    if !containerShutdownComplete {
+      await snapshotLeaseCoordinator.close()
+      decodedProjectionPageCache.close()
+      await container.shutdown()
+      containerShutdownComplete = true
+    }
+    let result: DesignDatabaseRuntimeTermination
+    do {
+      try await ownedContainer?.release()
+      ownedContainer = nil
+      result = .closed
+    } catch { result = .cleanupFailed(reason: String(describing: error)) }
+    isClosing = false
+    let waiters = closeWaiters
+    closeWaiters.removeAll(keepingCapacity: false)
+    for waiter in waiters { waiter.resume(returning: result) }
+    return result
   }
 
   package func context() throws(DesignDatabaseRuntimeError) -> DatabaseContext {

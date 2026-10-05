@@ -526,6 +526,128 @@ public actor DesignDatabaseRuntimeHandle:
     }
   }
 
+  public func collectRevisions(
+    _ request: DesignRevisionCollectionRequest,
+    budget: DesignRevisionCollectionBudget
+  ) async throws(DesignDatabaseError) -> DesignRevisionCollectionStatus {
+    try await perform { try await self.collectRevisionsOperation(request, budget: budget) }
+  }
+
+  private func collectRevisionsOperation(
+    _ request: DesignRevisionCollectionRequest,
+    budget: DesignRevisionCollectionBudget
+  ) async throws(DesignDatabaseError) -> DesignRevisionCollectionStatus {
+    try await authorizeRevisionCollection(operation: request.operation, requiresOwnScope: true)
+    let count = UInt64(request.revisions.count)
+    guard count <= budget.maximumRevisionCount else {
+      throw .resourceExhausted(limit: budget.maximumRevisionCount, requested: count)
+    }
+    let expectedDigest = try DesignRevisionCollectionDigest.request(
+      operation: request.operation, revisions: request.revisions, using: SHA256ContentDigester())
+    guard expectedDigest == request.requestDigest else {
+      throw .contentDigest("The collection request digest does not match its canonical targets.")
+    }
+    return try await performMaintenanceStorage(operation: request.operation) {
+      // Reject an impossible batch before persisting a deleting fence.
+      let ceiling = (DesignDatabaseRuntimeCommitBuildIntent.stagingTransactionWriteLimit - 1) / 2
+      guard budget.maximumPhysicalDeletionCount <= ceiling else {
+        throw DesignDatabaseRuntimeError.collectionRootAuditBudgetExceeded(
+          kind: "collection sweep physical deletions", limit: ceiling,
+          requested: budget.maximumPhysicalDeletionCount)
+      }
+      let candidates = try DesignDatabaseRuntimeRevisionDeletionCandidateSet(
+        revisions: request.revisions, maximumRevisionCount: budget.maximumRevisionCount)
+      let admissionRequest = try DesignDatabaseRuntimeCollectionAdmissionRequest(
+        operation: request.operation, candidates: candidates, using: SHA256ContentDigester())
+      let rootBudget = try DesignDatabaseRuntimeCollectionRootAuditBudget(
+        maximumReferenceCount: budget.maximumReferenceCount,
+        maximumRetentionCount: budget.maximumRetentionCount,
+        maximumBuildIntentCount: budget.maximumBuildIntentCount,
+        maximumManifestCount: budget.maximumManifestCount,
+        maximumGraphEdgeCount: budget.maximumGraphEdgeCount,
+        maximumPhysicalIdentityCount: budget.maximumPhysicalIdentityCount,
+        maximumPhysicalClaimCount: budget.maximumPhysicalClaimCount,
+        scanPageSize: budget.scanPageSize,
+        maximumGenerationRetryCount: budget.maximumGenerationRetryCount)
+      switch try await self.attachment.admitRevisionCollection(admissionRequest, budget: rootBudget) {
+      case .outcomeUnknown(let operation, let digest):
+        return .outcomeUnknown(operation: operation, requestDigest: digest)
+      case .admitted, .collected:
+        return try self.publicCollectionResult(await self.attachment.sweepRevisionCollection(
+          operation: request.operation, requestDigest: request.requestDigest,
+          maximumPhysicalDeletionCount: budget.maximumPhysicalDeletionCount,
+          maximumRevisionCount: budget.maximumRevisionCount,
+          maximumPhysicalIdentityCount: budget.maximumPhysicalClaimCount))
+      }
+    }
+  }
+
+  public func revisionCollectionStatus(
+    operation: DesignDatabaseOperationReference,
+    requestDigest: ContentDigest,
+    budget: DesignRevisionCollectionBudget
+  ) async throws(DesignDatabaseError) -> DesignRevisionCollectionStatus {
+    try await perform {
+      try await self.authorizeRevisionCollection(operation: operation, requiresOwnScope: false)
+      guard requestDigest.algorithm == .sha256 else {
+        throw DesignDatabaseError.contentDigest("Collection status requires a SHA-256 request identity.")
+      }
+      return try await self.performMaintenanceStorage(operation: operation) {
+        guard let result = try await self.attachment.revisionCollectionStatus(
+          operation: operation, requestDigest: requestDigest,
+          maximumRevisionCount: budget.maximumRevisionCount,
+          maximumPhysicalIdentityCount: budget.maximumPhysicalClaimCount) else { return .notRecorded }
+        return try self.publicCollectionResult(result)
+      }
+    }
+  }
+
+  private func authorizeRevisionCollection(
+    operation: DesignDatabaseOperationReference,
+    requiresOwnScope: Bool
+  ) async throws(DesignDatabaseError) {
+    try requireGrant(.administer)
+    guard operation.databaseID == databaseID else {
+      throw .crossDatabaseReference(expected: databaseID, actual: operation.databaseID)
+    }
+    guard !requiresOwnScope || operation.authorizationSubjectScopeID == authorizationSubjectScopeID else {
+      throw .unauthorized(grant: .administer, subjectScopeID: authorizationSubjectScopeID)
+    }
+    try await authorizer.authorize(.administer, for: authorizationSubjectScopeID)
+    guard await attachment.hasExclusiveMaintenanceAuthority else {
+      do {
+        let capability = try DesignCapabilityID(rawValue: "design-database.revision-collection")
+        throw DesignDatabaseError.unsupportedCapability(capability)
+      } catch let error as DesignDatabaseError { throw error }
+      catch { throw .corruption("The revision collection capability identifier is invalid.") }
+    }
+  }
+
+  private nonisolated func publicCollectionResult(
+    _ result: DesignDatabaseRuntimeCollectionSweepResult
+  ) throws(DesignDatabaseError) -> DesignRevisionCollectionStatus {
+    switch result {
+    case .outcomeUnknown(let operation, let digest):
+      return .outcomeUnknown(operation: operation, requestDigest: digest)
+    case .sweeping(let progress):
+      return .inProgress(DesignRevisionCollectionProgress(operation: progress.operation,
+        requestDigest: progress.requestDigest,
+        deletedPhysicalIdentityCount: progress.deletedPhysicalIdentityCount,
+        physicalIdentityCount: progress.physicalIdentityCount, intentStateDigest: progress.intentStateDigest))
+    case .collected(let receipt):
+      guard let admitted = UInt64(exactly: receipt.admittedReachabilityGeneration),
+            let completed = UInt64(exactly: receipt.completedReachabilityGeneration) else {
+        throw .corruption("Collection returned an invalid reachability generation.")
+      }
+      return .collected(DesignRevisionCollectionReceipt(operation: receipt.operation,
+        requestDigest: receipt.requestDigest, revisions: receipt.candidates.revisions,
+        originalRootSetDigest: receipt.originalRootSetDigest, physicalRootSetDigest: receipt.physicalRootSetDigest,
+        physicalIdentityDirectoryDigest: receipt.physicalIdentityDirectoryDigest,
+        physicalIdentityCount: receipt.physicalIdentityCount, admittedReachabilityGeneration: admitted,
+        completedReachabilityGeneration: completed, intentStateDigest: receipt.intentStateDigest))
+    }
+  }
+
   public func abandonCommit(
     _ request: DesignCommitAbandonmentRequest
   ) async throws(DesignDatabaseError) -> DesignCommitAbandonmentResult {
@@ -880,16 +1002,18 @@ public actor DesignDatabaseRuntimeHandle:
   }
 
   public func close() async -> DesignDatabaseTermination {
-    guard await lifecycle.beginClose() else { return .alreadyClosed }
-    await snapshotRegistry.closeAll()
+    let firstClose = await lifecycle.beginClose()
+    if firstClose { await snapshotRegistry.closeAll() }
     let termination: DesignDatabaseTermination
     switch await attachment.close() {
     case .closed:
       termination = .closed
     case .alreadyClosed:
       termination = .alreadyClosed
+    case .cleanupFailed(let reason):
+      termination = .cleanupFailed(reason: reason)
     }
-    await lifecycle.finishClose()
+    if firstClose { await lifecycle.finishClose() }
     return termination
   }
 
@@ -926,6 +1050,8 @@ public actor DesignDatabaseRuntimeHandle:
         .withAuthorizedAccess(body)
     } catch DesignDatabaseRuntimeError
       .commitAbandonmentIdempotencyConflict {
+      throw .idempotencyConflict(operation: operation)
+    } catch DesignDatabaseRuntimeError.collectionIdempotencyConflict {
       throw .idempotencyConflict(operation: operation)
     } catch let error as DesignDatabaseRuntimeError {
       throw map(error, operationID: operation.operationID)
@@ -1143,6 +1269,15 @@ public actor DesignDatabaseRuntimeHandle:
           operationID: operationID
         )
       )
+    case .deletionCandidateBudgetExceeded(let limit, let requested),
+         .collectionRootAuditBudgetExceeded(_, let limit, let requested):
+      return .resourceExhausted(limit: limit, requested: requested)
+    case .revisionStillReachable(let rawValue, let rootKind):
+      do {
+        let revision = DesignRevisionReference(databaseID: databaseID,
+          revisionID: try DesignRevisionID(hexadecimalValue: rawValue))
+        return .revisionStillReachable(revision: revision, rootKind: rootKind)
+      } catch { return .corruption("Runtime returned a malformed rooted revision identity.") }
     case .generationExhausted(let kind):
       return .generationExhausted(kind: kind)
     case .namedReferenceNotFound(let rawValue):

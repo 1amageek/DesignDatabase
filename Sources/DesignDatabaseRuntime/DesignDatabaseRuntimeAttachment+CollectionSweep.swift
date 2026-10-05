@@ -16,6 +16,32 @@ private struct DesignDatabaseRuntimeLoadedCollectionSweep: Sendable {
 }
 
 extension DesignDatabaseRuntimeAttachment {
+  /// Global maintenance reconciliation validates persisted state without advancing deletion.
+  package func revisionCollectionStatus(
+    operation: DesignDatabaseOperationReference,
+    requestDigest: ContentDigest,
+    maximumRevisionCount: UInt64,
+    maximumPhysicalIdentityCount: UInt64,
+    digester: any ContentDigesting = SHA256ContentDigester()
+  ) async throws(DesignDatabaseRuntimeError) -> DesignDatabaseRuntimeCollectionSweepResult? {
+    let databaseContext = try context()
+    let key = DesignDatabaseRuntimeOperationClaim.key(operation)
+    let absent: Bool
+    do {
+      absent = try await databaseContext.withTransaction { transaction in
+        let claim = try await transaction.fetch(DesignOperationClaimModel.self, identifiedBy: key, consistency: .serializable)
+        let intent = try await transaction.fetch(DesignCollectionIntentModel.self, identifiedBy: key, consistency: .serializable)
+        let directory = try await transaction.fetch(DesignCollectionPhysicalIdentityDirectoryModel.self, identifiedBy: key, consistency: .serializable)
+        return claim == nil && intent == nil && directory == nil
+      }
+    } catch { throw .commitTransactionFailed(reason: String(describing: error)) }
+    if absent { return nil }
+    let loaded = try await loadCollectionSweep(operation: operation, requestDigest: requestDigest,
+      maximumRevisionCount: maximumRevisionCount, maximumPhysicalIdentityCount: maximumPhysicalIdentityCount,
+      using: digester)
+    return try collectionSweepResult(loaded)
+  }
+
   package func sweepRevisionCollection(
     operation: DesignDatabaseOperationReference,
     requestDigest: ContentDigest,

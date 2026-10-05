@@ -24,6 +24,7 @@ public enum DesignDatabaseError: Error, Sendable, Equatable, DesignDatabaseSeria
   case revisionNotFound(DesignRevisionReference)
   case revisionDeleting(DesignRevisionReference)
   case revisionCollected(DesignRevisionReference)
+  case revisionStillReachable(revision: DesignRevisionReference, rootKind: String)
   case referenceNotFound(DesignReferenceName)
   case entityNotFound(DesignEntityKey)
   case entityAlreadyExists(DesignEntityKey)
@@ -103,6 +104,8 @@ public enum DesignDatabaseError: Error, Sendable, Equatable, DesignDatabaseSeria
       return "Revision \(revision.revisionID) is unavailable while collection is in progress."
     case .revisionCollected(let revision):
       return "Revision \(revision.revisionID) has been collected."
+    case .revisionStillReachable(let revision, let rootKind):
+      return "Revision \(revision.revisionID) remains protected by \(rootKind)."
     case .referenceNotFound(let reference):
       return "Named reference \(reference.rawValue) was not found."
     case .entityNotFound(let entity):
